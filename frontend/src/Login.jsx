@@ -38,7 +38,7 @@ export default function Login() {
     try {
       const response = await fetch('http://localhost:3000/api/me', {
         method: 'GET',
-        credentials: 'include', // CRITICAL FIX
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json'
         }
@@ -71,7 +71,7 @@ export default function Login() {
     try {
       const response = await fetch('http://localhost:3000/api/signin', {
         method: 'POST',
-        credentials: 'include', // CRITICAL FIX
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
         },
@@ -126,7 +126,7 @@ export default function Login() {
     try {
       const response = await fetch('http://localhost:3000/api/signup', {
         method: 'POST',
-        credentials: 'include', // CRITICAL FIX
+        credentials: 'include',
         headers: {
           'Content-Type': 'application/json',
         },
@@ -188,12 +188,34 @@ export default function Login() {
     }
   };
 
+  const handleAboutUsClick = () => {
+    navigate('/about-us');
+  };
+
+  const handleContactUsClick = () => {
+    navigate('/about-us#connect-section');
+  };
+
   return (
     <div className="login-page">
       <link
         rel="stylesheet"
         href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css"
       />
+
+      <button className="button about-us-btn" onClick={handleAboutUsClick}>
+        <span className="hoverEffect">
+          <div></div>
+        </span>
+        <span className="button-text">About Us</span>
+      </button>
+
+      <button className="button contact-us-btn" onClick={handleContactUsClick}>
+        <span className="hoverEffect">
+          <div></div>
+        </span>
+        <span className="button-text">Contact Us</span>
+      </button>
 
       {message.show && (
         <div className={`message ${message.isError ? 'error' : 'success'}`}>
