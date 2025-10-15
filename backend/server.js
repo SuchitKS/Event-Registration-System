@@ -38,8 +38,8 @@ app.use(session({
 
 // STEP 4: Debug middleware to log all requests
 app.use((req, res, next) => {
-    console.log(`\n📍 ${req.method} ${req.url}`);
-    console.log('🔐 Session ID:', req.sessionID);
+    console.log(`\n🔍 ${req.method} ${req.url}`);
+    console.log('📋 Session ID:', req.sessionID);
     console.log('👤 User USN:', req.session.userUSN || 'Not logged in');
     console.log('🍪 Cookies:', req.headers.cookie || 'No cookies');
     next();
@@ -693,7 +693,7 @@ app.get('/api/events/:eventId/participant-count', requireAuth, async (req, res) 
     }
 });
 
-// Individual Event Details Route
+// Individual Event Details Route (for organizer ticket page)
 app.get('/api/events/:eventId', requireAuth, async (req, res) => {
     try {
         const eventId = req.params.eventId;
@@ -888,5 +888,5 @@ app.get('/api/scan-qr', async (req, res) => {
 app.listen(PORT, () => {
     console.log(`\n🚀 Server running at http://localhost:${PORT}`);
     console.log(`📡 CORS enabled for http://localhost:5173`);
-    console.log(`🔐 Session debugging ENABLED\n`);
+    console.log(`🔍 Session debugging ENABLED\n`);
 });
