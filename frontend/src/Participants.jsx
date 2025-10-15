@@ -120,7 +120,7 @@ const Participants = () => {
   };
 
   const handleEventButtonClick = (eventId, eventType) => {
-    window.location.href = `/ticket3.html?eventId=${eventId}`;
+    navigate(`/participant-ticket?eventId=${eventId}`);
   };
 
   const handleParticipateClick = () => {

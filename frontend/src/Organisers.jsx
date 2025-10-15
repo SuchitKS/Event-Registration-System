@@ -102,7 +102,7 @@ const Organisers = () => {
   };
 
   const handleEventButtonClick = (eventId, eventType) => {
-    window.location.href = `/ticket.html?eventId=${eventId}`;
+    navigate(`/organiser-ticket?eventId=${eventId}`);
   };
 
   const handleOrganiseClick = () => {

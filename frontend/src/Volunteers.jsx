@@ -102,7 +102,7 @@ const Volunteers = () => {
   };
 
   const handleEventButtonClick = (eventId, eventType) => {
-    window.location.href = `/ticket2.html?eventId=${eventId}`;
+    navigate(`/volunteer-ticket?eventId=${eventId}`);
   };
 
   const handleVolunteerClick = () => {
