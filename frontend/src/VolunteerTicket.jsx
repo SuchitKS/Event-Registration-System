@@ -21,8 +21,10 @@ export default function VolunteerTicket() {
 
   const fetchEventData = async (eventId) => {
     try {
-      const response = await fetch('/api/my-volunteer-events');
-      
+      const response = await fetch('http://localhost:3000/api/my-volunteer-events', {
+        credentials: 'include',
+      });
+
       if (!response.ok) {
         throw new Error('Failed to fetch volunteer events');
       }
@@ -32,16 +34,19 @@ export default function VolunteerTicket() {
 
       // Search in array format
       if (data.volunteerEvents && Array.isArray(data.volunteerEvents)) {
-        foundEvent = data.volunteerEvents.find(event => 
-          event.eid == eventId || event.id == eventId
+        foundEvent = data.volunteerEvents.find(
+          (event) => event.eid == eventId || event.id == eventId
         );
-      } 
+      }
       // Search in object format with categories
       else if (data.volunteerEvents && typeof data.volunteerEvents === 'object') {
         for (const category of ['ongoing', 'completed', 'upcoming']) {
-          if (data.volunteerEvents[category] && Array.isArray(data.volunteerEvents[category])) {
-            foundEvent = data.volunteerEvents[category].find(event => 
-              event.eid == eventId || event.id == eventId
+          if (
+            data.volunteerEvents[category] &&
+            Array.isArray(data.volunteerEvents[category])
+          ) {
+            foundEvent = data.volunteerEvents[category].find(
+              (event) => event.eid == eventId || event.id == eventId
             );
             if (foundEvent) break;
           }
@@ -66,13 +71,17 @@ export default function VolunteerTicket() {
     window.location.href = '/volunteers.html';
   };
 
+  const handleScanQR = () => {
+    window.location.href = '/scanner';
+  };
+
   const formatDate = (dateString) => {
     if (!dateString) return 'Not specified';
     const date = new Date(dateString);
     return date.toLocaleDateString('en-US', {
       year: 'numeric',
       month: 'long',
-      day: 'numeric'
+      day: 'numeric',
     });
   };
 
@@ -118,9 +127,7 @@ export default function VolunteerTicket() {
               <h1 className="tk-event-title">
                 {eventData.ename || eventData.name || 'Untitled Event'}
               </h1>
-              <p className="tk-event-id">
-                Event ID: {eventData.eid || eventData.id}
-              </p>
+              <p className="tk-event-id">Event ID: {eventData.eid || eventData.id}</p>
             </div>
 
             <div className="tk-ticket-content">
@@ -189,14 +196,14 @@ export default function VolunteerTicket() {
             </div>
 
             <div className="tk-ticket-footer">
-              <a 
-                href="/scanner.html" 
+              <button
+                onClick={handleScanQR}
                 className="tk-qr-placeholder tk-qr-scanner"
                 title="Open QR Scanner"
               >
                 📱
                 <div className="tk-qr-text">SCAN QR</div>
-              </a>
+              </button>
             </div>
           </div>
         )}

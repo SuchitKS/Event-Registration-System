@@ -21,8 +21,10 @@ export default function ParticipantTicket() {
 
   const fetchEventData = async (eventId) => {
     try {
-      const response = await fetch('/api/my-participant-events');
-      
+      const response = await fetch('http://localhost:3000/api/my-participant-events', {
+        credentials: 'include',
+      });
+
       if (!response.ok) {
         throw new Error('Failed to fetch participant events');
       }
@@ -32,16 +34,19 @@ export default function ParticipantTicket() {
 
       // Search in array format
       if (data.participantEvents && Array.isArray(data.participantEvents)) {
-        foundEvent = data.participantEvents.find(event => 
-          event.eid == eventId || event.id == eventId
+        foundEvent = data.participantEvents.find(
+          (event) => event.eid == eventId || event.id == eventId
         );
-      } 
+      }
       // Search in object format with categories
       else if (data.participantEvents && typeof data.participantEvents === 'object') {
         for (const category of ['ongoing', 'completed', 'upcoming']) {
-          if (data.participantEvents[category] && Array.isArray(data.participantEvents[category])) {
-            foundEvent = data.participantEvents[category].find(event => 
-              event.eid == eventId || event.id == eventId
+          if (
+            data.participantEvents[category] &&
+            Array.isArray(data.participantEvents[category])
+          ) {
+            foundEvent = data.participantEvents[category].find(
+              (event) => event.eid == eventId || event.id == eventId
             );
             if (foundEvent) break;
           }
@@ -66,13 +71,17 @@ export default function ParticipantTicket() {
     window.location.href = '/participants.html';
   };
 
+  const handleScanQR = () => {
+    window.location.href = '/scanner';
+  };
+
   const formatDate = (dateString) => {
     if (!dateString) return 'Not specified';
     const date = new Date(dateString);
     return date.toLocaleDateString('en-US', {
       year: 'numeric',
       month: 'long',
-      day: 'numeric'
+      day: 'numeric',
     });
   };
 
@@ -118,9 +127,7 @@ export default function ParticipantTicket() {
               <h1 className="tk-event-title">
                 {eventData.ename || eventData.name || 'Untitled Event'}
               </h1>
-              <p className="tk-event-id">
-                Event ID: {eventData.eid || eventData.id}
-              </p>
+              <p className="tk-event-id">Event ID: {eventData.eid || eventData.id}</p>
             </div>
 
             <div className="tk-ticket-content">
@@ -189,14 +196,14 @@ export default function ParticipantTicket() {
             </div>
 
             <div className="tk-ticket-footer">
-              <a 
-                href="/scanner.html" 
+              <button
+                onClick={handleScanQR}
                 className="tk-qr-placeholder tk-qr-scanner"
                 title="Open QR Scanner"
               >
                 📱
                 <div className="tk-qr-text">SCAN QR</div>
-              </a>
+              </button>
             </div>
           </div>
         )}

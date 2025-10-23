@@ -146,63 +146,122 @@
 .organisers-page .card__heading {
   color: var(--text-lighter);
   font-size: 1.9rem;
-  text-shadow: 2px 2px 20px rgba(0,0,0,0.5);
+  text-shadow: 2px 2px 20px rgba(255, 255, 255, 0.5);
   line-height: 1.4;
-  word-spacing: 2px;
+  word-spacing: 100vw;
   margin-bottom: var(--spacing-m);
 }
 
 .organisers-page .card__details {
-  color: var(--text-light);
-  font-size: 0.95rem;
-  line-height: 1.6;
-  overflow-y: auto;
-  padding: var(--spacing-m);
+  margin-top: var(--spacing-m);
   background: rgba(0, 0, 0, 0.6);
+  padding: var(--spacing-m);
   border-radius: var(--spacing-s);
-  flex-grow: 1;
-  backdrop-filter: blur(5px);
+  display: block;
+  flex: 1;
+  overflow-y: auto;
+  opacity: 1;
+  pointer-events: auto;
+  backdrop-filter: blur(10px);
 }
 
 .organisers-page .event-item {
-  background: rgba(255,255,255,0.05);
-  border-radius: var(--spacing-s);
-  padding: var(--spacing-m);
-  margin-bottom: var(--spacing-m);
+  padding: 15px;
+  background: rgba(247, 246, 246, 0.1);
+  border-radius: 8px;
+  margin-bottom: 15px;
   display: flex;
   justify-content: space-between;
-  align-items: center;
-  transition: transform 0.2s ease;
+  align-items: flex-start;
+  gap: 15px;
+  transition: background 0.2s ease;
+}
+
+.organisers-page .event-item:last-child {
+  margin-bottom: 0;
 }
 
 .organisers-page .event-item:hover {
-  transform: translateY(-2px);
-  background: rgba(255,255,255,0.1);
+  background: rgba(255, 255, 255, 0.15);
+}
+
+.organisers-page .event-info {
+  flex: 1;
+  min-width: 0;
+  color: white;
+}
+
+.organisers-page .event-item p,
+.organisers-page .event-item strong {
+  color: white;
 }
 
 .organisers-page .event-info p {
-  margin: 4px 0;
+  margin-bottom: 6px;
   font-size: 0.9rem;
+  line-height: 1.5;
+  color: white;
+}
+
+.organisers-page .event-info p:last-child {
+  margin-bottom: 0;
+}
+
+.organisers-page .event-info strong {
+  font-weight: 600;
+  font-size: 1rem;
+  color: white;
 }
 
 .organisers-page .event-actions {
+  flex-shrink: 0;
   display: flex;
-  gap: var(--spacing-s);
+  align-items: center;
 }
 
 .organisers-page .event-btn {
-  padding: 8px 16px;
-  background: var(--primary-color);
-  color: white;
-  border: none;
-  border-radius: 4px;
+  padding: 8px 14px;
+  border-radius: 6px;
+  border: 1px solid rgba(255, 255, 255, 0.3);
+  font-size: 11px;
+  text-transform: uppercase;
+  font-weight: 600;
+  letter-spacing: 1px;
+  background: rgba(255, 255, 255, 0.1);
+  color: #fff;
   cursor: pointer;
-  font-size: 0.85rem;
-  transition: background 0.2s;
+  transition: all 0.2s ease;
+  backdrop-filter: blur(10px);
+  white-space: nowrap;
 }
 
 .organisers-page .event-btn:hover {
-  background: #0d5bb5;
+  background: rgba(255, 255, 255, 0.25);
+  border-color: rgba(255, 255, 255, 0.6);
+  transform: translateY(-2px);
+  box-shadow: 0 4px 12px rgba(0, 0, 0, 0.3);
+}
+
+.organisers-page .event-btn:active {
+  transform: translateY(0);
+  box-shadow: 0 2px 6px rgba(247, 247, 247, 0.2);
+}
+
+.organisers-page .card__details::-webkit-scrollbar {
+  width: 6px;
+}
+
+.organisers-page .card__details::-webkit-scrollbar-track {
+  background: transparent;
+}
+
+.organisers-page .card__details::-webkit-scrollbar-thumb {
+  background: rgba(255,255,255,0.4);
+  border-radius: 3px;
+}
+
+.organisers-page .card__details::-webkit-scrollbar-thumb:hover {
+  background: rgba(255,255,255,0.6);
 }
 
 .organisers-page .button-container {
@@ -341,6 +400,7 @@
 
   .organisers-page .event-info p {
     font-size: 0.85rem;
+    color: white;
   }
 
   .organisers-page .event-actions {

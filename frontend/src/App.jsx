@@ -14,6 +14,7 @@ import VolunteerTicket from './VolunteerTicket';
 import ParticipantTicket from './ParticipantTicket';
 import AboutUs from './Aboutus'
 import QrCode from './QrCode';
+import Scanner from './Scanner';
 
 function App() {
   return (
@@ -32,6 +33,7 @@ function App() {
         <Route path="/volunteer-ticket" element={<VolunteerTicket/>} />
         <Route path="/about-us" element={<AboutUs/>} />
         <Route path="/qr" element={<QrCode/>} />
+        <Route path="/scanner" element={<Scanner/>} />
         <Route path="*" element={<Navigate to="/" replace />} />
       </Routes>
     </Router>
