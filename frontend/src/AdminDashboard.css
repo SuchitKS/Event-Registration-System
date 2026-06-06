@@ -105,14 +105,8 @@
   text-align: left;
   position: relative;
 }
-.adm-nav-btn i {
-  width: 16px;
-  font-size: 13px;
-}
-.adm-nav-btn:hover {
-  color: #fff;
-  background: rgba(255,255,255,0.05);
-}
+.adm-nav-btn i { width: 16px; font-size: 13px; }
+.adm-nav-btn:hover { color: #fff; background: rgba(255,255,255,0.05); }
 .adm-nav-btn.active {
   color: #FFE500;
   background: rgba(255,229,0,0.08);
@@ -219,6 +213,30 @@
   padding-bottom: 0;
 }
 
+/* ── Refresh button ───────────────────────────────────────────── */
+.adm-refresh-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 8px 14px;
+  font-family: 'Space Mono', monospace;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.06em;
+  background: #fff;
+  color: #0a0a0a;
+  border: 2px solid #0a0a0a;
+  box-shadow: 2px 2px 0 #0a0a0a;
+  cursor: pointer;
+  transition: transform 0.1s, box-shadow 0.1s;
+}
+.adm-refresh-btn:hover:not(:disabled) {
+  transform: translate(-1px, -1px);
+  box-shadow: 3px 3px 0 #0a0a0a;
+}
+.adm-refresh-btn:disabled { opacity: 0.5; cursor: not-allowed; }
+
 /* ── Stats grid ───────────────────────────────────────────────── */
 .adm-stats-grid {
   display: grid;
@@ -277,10 +295,7 @@
 }
 
 /* ── Filter group ─────────────────────────────────────────────── */
-.adm-filter-group {
-  display: flex;
-  gap: 0;
-}
+.adm-filter-group { display: flex; gap: 0; }
 .adm-filter-btn {
   padding: 8px 16px;
   font-family: 'Space Mono', monospace;
@@ -296,27 +311,21 @@
   transition: background 0.1s, color 0.1s;
 }
 .adm-filter-btn:last-child { border-right: 2px solid #0a0a0a; }
-.adm-filter-btn.active {
-  background: #0a0a0a;
-  color: #FFE500;
-}
-.adm-filter-btn:hover:not(.active) {
-  background: #f5f0e8;
-  color: #0a0a0a;
-}
+.adm-filter-btn.active { background: #0a0a0a; color: #FFE500; }
+.adm-filter-btn:hover:not(.active) { background: #f5f0e8; color: #0a0a0a; }
 
 /* ── Request cards ────────────────────────────────────────────── */
-.adm-request-list {
-  display: flex;
-  flex-direction: column;
-  gap: 16px;
-}
+.adm-request-list { display: flex; flex-direction: column; gap: 16px; }
 
 .adm-request-card {
   background: #fff;
   border: 3px solid #0a0a0a;
   box-shadow: 5px 5px 0 #0a0a0a;
   padding: 20px 24px;
+  transition: box-shadow 0.15s;
+}
+.adm-request-card:hover {
+  box-shadow: 7px 7px 0 #0a0a0a;
 }
 
 .adm-request-top {
@@ -326,6 +335,7 @@
   margin-bottom: 16px;
   padding-bottom: 12px;
   border-bottom: 2px solid #f0ebe0;
+  flex-wrap: wrap;
 }
 
 .adm-request-name {
@@ -344,6 +354,22 @@
   border: 1.5px solid #ddd;
 }
 
+/* ── Organizer badge (crown) ──────────────────────────────────── */
+.adm-organizer-badge {
+  margin-left: auto;
+  font-family: 'Space Mono', monospace;
+  font-size: 9px;
+  font-weight: 700;
+  letter-spacing: 0.1em;
+  text-transform: uppercase;
+  background: #FFE500;
+  color: #0a0a0a;
+  border: 1.5px solid #0a0a0a;
+  padding: 3px 8px;
+  display: inline-flex;
+  align-items: center;
+}
+
 .adm-request-grid {
   display: grid;
   grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
@@ -351,11 +377,7 @@
   margin-bottom: 16px;
 }
 
-.adm-request-field {
-  display: flex;
-  flex-direction: column;
-  gap: 3px;
-}
+.adm-request-field { display: flex; flex-direction: column; gap: 3px; }
 
 .adm-field-key {
   font-family: 'Space Mono', monospace;
@@ -374,13 +396,59 @@
   word-break: break-word;
 }
 
-.adm-request-actions {
-  display: flex;
-  gap: 12px;
-  flex-wrap: wrap;
+.adm-request-actions { display: flex; gap: 12px; flex-wrap: wrap; }
+
+/* ── Role edit form ───────────────────────────────────────────── */
+.adm-role-edit-form {
+  background: #f8f4ea;
+  border: 2px solid #0a0a0a;
+  padding: 16px 20px;
+  margin-bottom: 0;
+  animation: adm-slide-in 0.15s ease-out;
 }
 
-.adm-approve-btn, .adm-reject-btn {
+.adm-role-edit-title {
+  font-family: 'Space Mono', monospace;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.1em;
+  color: #0a0a0a;
+  margin-bottom: 14px;
+}
+
+.adm-role-edit-fields {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+
+@media (max-width: 600px) {
+  .adm-role-edit-fields { grid-template-columns: 1fr; }
+}
+
+.adm-role-field-group { display: flex; flex-direction: column; gap: 5px; }
+
+.adm-role-input {
+  padding: 9px 12px;
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 13px;
+  font-weight: 600;
+  border: 2px solid #0a0a0a;
+  background: #fff;
+  color: #0a0a0a;
+  outline: none;
+  transition: box-shadow 0.1s;
+  width: 100%;
+  box-sizing: border-box;
+}
+.adm-role-input:focus { box-shadow: 3px 3px 0 #0a0a0a; }
+
+.adm-role-edit-actions { display: flex; gap: 10px; flex-wrap: wrap; }
+
+/* ── Buttons ──────────────────────────────────────────────────── */
+.adm-approve-btn, .adm-reject-btn, .adm-edit-role-btn, .adm-cancel-btn {
   display: inline-flex;
   align-items: center;
   gap: 8px;
@@ -395,30 +463,34 @@
   transition: transform 0.1s, box-shadow 0.1s;
 }
 .adm-approve-btn {
-  background: #FFE500;
-  color: #0a0a0a;
-  box-shadow: 3px 3px 0 #0a0a0a;
+  background: #FFE500; color: #0a0a0a; box-shadow: 3px 3px 0 #0a0a0a;
 }
 .adm-approve-btn:hover:not(:disabled) {
-  transform: translate(-2px, -2px);
-  box-shadow: 5px 5px 0 #0a0a0a;
+  transform: translate(-2px, -2px); box-shadow: 5px 5px 0 #0a0a0a;
 }
 .adm-reject-btn {
-  background: #fff;
-  color: #ff4444;
-  border-color: #ff4444;
-  box-shadow: 3px 3px 0 #aa0000;
+  background: #fff; color: #ff4444; border-color: #ff4444; box-shadow: 3px 3px 0 #aa0000;
 }
 .adm-reject-btn:hover:not(:disabled) {
-  background: #fff0f0;
-  transform: translate(-2px, -2px);
-  box-shadow: 5px 5px 0 #aa0000;
+  background: #fff0f0; transform: translate(-2px, -2px); box-shadow: 5px 5px 0 #aa0000;
+}
+.adm-edit-role-btn {
+  background: #fff; color: #0a0a0a; box-shadow: 3px 3px 0 #0a0a0a;
+}
+.adm-edit-role-btn:hover:not(:disabled) {
+  background: #f5f0e8; transform: translate(-2px, -2px); box-shadow: 5px 5px 0 #0a0a0a;
+}
+.adm-cancel-btn {
+  background: #eee; color: #666; border-color: #999; box-shadow: 3px 3px 0 #999;
+}
+.adm-cancel-btn:hover:not(:disabled) {
+  background: #ddd; transform: translate(-1px, -1px);
 }
 .adm-approve-btn:disabled,
-.adm-reject-btn:disabled {
-  opacity: 0.6;
-  cursor: not-allowed;
-  transform: none;
+.adm-reject-btn:disabled,
+.adm-edit-role-btn:disabled,
+.adm-cancel-btn:disabled {
+  opacity: 0.6; cursor: not-allowed; transform: none;
 }
 
 /* ── Table ────────────────────────────────────────────────────── */
@@ -489,16 +561,8 @@
   padding: 3px 8px;
   border: 1.5px solid;
 }
-.adm-role-badge.admin {
-  background: #FFE500;
-  color: #0a0a0a;
-  border-color: #0a0a0a;
-}
-.adm-role-badge.user {
-  background: #f5f0e8;
-  color: #888;
-  border-color: #ccc;
-}
+.adm-role-badge.admin { background: #FFE500; color: #0a0a0a; border-color: #0a0a0a; }
+.adm-role-badge.user  { background: #f5f0e8; color: #888; border-color: #ccc; }
 
 .adm-delete-btn {
   display: inline-flex;
@@ -521,22 +585,7 @@
 }
 .adm-delete-btn:disabled { opacity: 0.5; cursor: not-allowed; }
 
-/* ── Utilities ────────────────────────────────────────────────── */
-.adm-loading {
-  display: flex;
-  justify-content: center;
-  padding: 60px 0;
-}
-.adm-spinner {
-  width: 32px;
-  height: 32px;
-  border: 4px solid #ddd;
-  border-top-color: #0a0a0a;
-  border-radius: 50%;
-  animation: adm-spin 0.7s linear infinite;
-}
-@keyframes adm-spin { to { transform: rotate(360deg); } }
-
+/* ── Empty state ──────────────────────────────────────────────── */
 .adm-empty {
   text-align: center;
   padding: 60px 20px;
@@ -546,6 +595,59 @@
   text-transform: uppercase;
   letter-spacing: 0.06em;
 }
+
+.adm-empty-state {
+  display: flex;
+  flex-direction: column;
+  align-items: center;
+  justify-content: center;
+  padding: 80px 20px;
+  gap: 14px;
+  border: 3px dashed #ddd;
+  background: #fdfaf4;
+}
+
+.adm-empty-icon {
+  width: 56px;
+  height: 56px;
+  background: #f5f0e8;
+  border: 3px solid #ddd;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  font-size: 22px;
+  color: #bbb;
+}
+
+.adm-empty-title {
+  font-family: 'Space Mono', monospace;
+  font-size: 13px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #555;
+}
+
+.adm-empty-sub {
+  font-family: 'Space Grotesk', sans-serif;
+  font-size: 13px;
+  color: #aaa;
+  text-align: center;
+  max-width: 320px;
+  line-height: 1.5;
+}
+
+/* ── Utilities ────────────────────────────────────────────────── */
+.adm-loading { display: flex; justify-content: center; padding: 60px 0; }
+.adm-spinner {
+  width: 32px;
+  height: 32px;
+  border: 4px solid #ddd;
+  border-top-color: #0a0a0a;
+  border-radius: 50%;
+  animation: adm-spin 0.7s linear infinite;
+}
+@keyframes adm-spin { to { transform: rotate(360deg); } }
 
 .adm-btn-spinner {
   width: 12px;
@@ -558,13 +660,9 @@
 
 /* ── Responsive ───────────────────────────────────────────────── */
 @media (max-width: 768px) {
-  .adm-sidebar {
-    width: 60px;
-  }
-  .adm-nav-btn span,
-  .adm-logo-tag,
-  .adm-logo-flo { display: none; }
-  .adm-logo-flo { display: block; font-size: 14px; }
+  .adm-sidebar { width: 60px; }
+  .adm-nav-btn span, .adm-logo-tag { display: none; }
+  .adm-logo-flo { font-size: 14px; }
   .adm-nav-btn { padding: 14px; justify-content: center; }
   .adm-nav-btn.active { border-left: 3px solid #FFE500; padding-left: 11px; }
   .adm-logout-btn span { display: none; }
