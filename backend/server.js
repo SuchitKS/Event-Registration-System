@@ -329,12 +329,17 @@ app.get('/api/me', requireAuth, async (req, res) => {
     try {
         const student = await queryOne('SELECT usn, sname, sem, mobno, emailid, organizer_pin, google_id, password_hash FROM student WHERE usn = $1', [req.session.userUSN]);
         if (!student) return res.status(404).json({ error: 'User not found' });
+        
+        // NEW: Check if this user is an approved organizer
+        const orgReq = await queryOne("SELECT id FROM organizer_request WHERE usn = $1 AND status = 'approved' LIMIT 1", [req.session.userUSN]);
+        
         res.json({
             userUSN: student.usn, userName: student.sname, semester: student.sem,
             mobile: student.mobno, email: student.emailid,
             hasPinSet: !!student.organizer_pin,
             hasGoogleIdentity: !!student.google_id,
             hasPasswordIdentity: !!student.password_hash,
+            isOrganiser: !!orgReq  // This passes the flag to your events.jsx page!
         });
     } catch (err) {
         res.status(500).json({ error: 'Error fetching user info' });
@@ -1242,6 +1247,11 @@ app.post('/api/events/:eventId/register-upi', requireAuth, async (req, res) => {
             if (count >= eventData.maxpart) return res.status(400).json({ error: 'Event is full' });
         }
 
+        await query(`
+            UPDATE registration_queue SET status = 'submitted'
+            WHERE event_id = $1 AND usn = $2
+        `, [eventId, userUSN]);
+
         await query('INSERT INTO payment (usn, event_id, amount, status, upi_transaction_id) VALUES ($1, $2, $3, $4, $5)',
             [userUSN, eventId, amount, 'pending_verification', transaction_id]);
 
@@ -1799,6 +1809,604 @@ app.get('/api/events/:eventId/generate-details', requireAuth, async (req, res) =
         res.status(500).json({ error: 'Error generating Excel file: ' + err.message });
     }
 });
+
+
+// ============================================================
+// NEW ROUTES — ADD THESE BEFORE app.listen()
+// ============================================================
+
+// ─── Admin Auth Middleware ──────────────────────────────────────────────────────
+// ============================================================
+// ADMIN ROUTES & AUTHENTICATION
+// ============================================================
+
+// ─── Admin Auth Middleware ──────────────────────────────────────────────────────
+async function requireAdmin(req, res, next) {
+    const authHeader = req.headers['authorization'];
+    const token = authHeader && authHeader.split(' ')[1];
+    if (!token) return res.status(401).json({ error: 'Please sign in first' });
+    
+    try {
+        const decoded = jwt.verify(token, JWT_SECRET);
+        
+        // 1. New Way: Standalone generic Admin Token
+        if (decoded.role === 'admin') {
+            // Give them a dummy USN session so admin logging functionality (like reviewed_by) doesn't break
+            req.session = { userUSN: 'ADMIN', userName: 'Administrator', isAdmin: true };
+            return next();
+        }
+
+        // 2. Fallback Old Way: DB flag (optional, kept just in case you manually set someone in pgAdmin)
+        const student = await queryOne(
+            'SELECT usn, sname, emailid, is_admin FROM student WHERE usn = $1',
+            [decoded.usn]
+        );
+        if (!student) return res.status(401).json({ error: 'Account not found.' });
+        if (!student.is_admin) return res.status(403).json({ error: 'Admin access required.' });
+        
+        req.session = { userUSN: student.usn, userName: student.sname, userEmail: student.emailid, isAdmin: true };
+        next();
+    } catch (err) {
+        return res.status(401).json({ error: 'Session expired. Please sign in again.' });
+    }
+}
+
+// ─── Admin: Password Login endpoint ─────────────────────────────────────────────
+app.post('/api/admin/login', (req, res) => {
+    const { password } = req.body;
+    
+    // Hardcoded password bypass as requested
+    if (password === 'vibe') {
+        const adminToken = jwt.sign({ role: 'admin', usn: 'ADMIN' }, JWT_SECRET, { expiresIn: '1d' });
+        return res.json({ success: true, token: adminToken });
+    }
+    
+    return res.status(401).json({ error: 'Invalid admin password' });
+});
+
+// ─── Check if current token grants admin access ─────────────────────────────────
+app.get('/api/admin/check', requireAdmin, async (req, res) => {
+    // If it passed requireAdmin, they are good to go!
+    res.json({ isAdmin: true });
+});
+
+// ─── Admin: Get dashboard stats ────────────────────────────────────────────────
+app.get('/api/admin/stats', requireAdmin, async (req, res) => {
+    try {
+        const [
+            totalUsers,
+            totalEvents,
+            totalParticipants,
+            totalVolunteers,
+            pendingRequests,
+            revenueRows
+        ] = await Promise.all([
+            queryCount('SELECT count(*) FROM student'),
+            queryCount('SELECT count(*) FROM event'),
+            queryCount('SELECT count(*) FROM participant'),
+            queryCount('SELECT count(*) FROM volunteer'),
+            queryCount("SELECT count(*) FROM organizer_request WHERE status = 'pending'"),
+            query(`
+                SELECT COALESCE(SUM(p.amount), 0) AS total_revenue
+                FROM payment p
+                WHERE p.status = 'verified'
+            `)
+        ]);
+
+        const totalRevenue = parseFloat(revenueRows[0]?.total_revenue || 0);
+
+        res.json({
+            totalUsers,
+            totalEvents,
+            totalParticipants,
+            totalVolunteers,
+            pendingRequests,
+            totalRevenue
+        });
+    } catch (err) {
+        console.error('Admin stats error:', err);
+        res.status(500).json({ error: 'Error fetching stats' });
+    }
+});
+
+// ─── Admin: Get all organizer requests ─────────────────────────────────────────
+app.get('/api/admin/organizer-requests', requireAdmin, async (req, res) => {
+    try {
+        const { status = 'pending' } = req.query;
+        const rows = await query(`
+            SELECT r.*, s.sname, s.sem, s.mobno, s.emailid AS student_email
+            FROM organizer_request r
+            JOIN student s ON r.usn = s.usn
+            WHERE r.status = $1
+            ORDER BY r.created_at DESC
+        `, [status]);
+        res.json({ requests: rows });
+    } catch (err) {
+        res.status(500).json({ error: 'Error fetching organizer requests' });
+    }
+});
+
+// ─── Admin: Approve organizer request ──────────────────────────────────────────
+app.post('/api/admin/organizer-requests/:id/approve', requireAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const request = await queryOne(
+            'SELECT * FROM organizer_request WHERE id = $1 LIMIT 1',
+            [id]
+        );
+        if (!request) return res.status(404).json({ error: 'Request not found' });
+        if (request.status !== 'pending') return res.status(400).json({ error: 'Request already reviewed' });
+
+        // Check if club exists, create if not
+        let club = await queryOne(
+            'SELECT cid FROM club WHERE LOWER(cname) = LOWER($1) LIMIT 1',
+            [request.club_name]
+        );
+        if (!club) {
+            club = await queryOne(
+                'INSERT INTO club (cname, clubdesc, maxmembers) VALUES ($1, $2, 100) RETURNING cid',
+                [request.club_name, `${request.club_name} at ${request.college_name}`]
+            );
+        }
+
+        // Add student as club member if not already
+        const alreadyMember = await queryOne(
+            'SELECT clubid FROM memberof WHERE studentusn = $1 AND clubid = $2 LIMIT 1',
+            [request.usn, club.cid]
+        );
+        if (!alreadyMember) {
+            await query(
+                'INSERT INTO memberof (studentusn, clubid) VALUES ($1, $2)',
+                [request.usn, club.cid]
+            );
+        }
+
+        // Mark request approved
+        await query(`
+            UPDATE organizer_request
+            SET status = 'approved', reviewed_at = NOW(), reviewed_by = $1
+            WHERE id = $2
+        `, [req.session.userUSN, id]);
+
+        res.json({ success: true, message: `Organizer approved and added to club "${request.club_name}"` });
+    } catch (err) {
+        console.error('Approve error:', err);
+        res.status(500).json({ error: 'Error approving request: ' + err.message });
+    }
+});
+
+// ─── Admin: Reject organizer request ───────────────────────────────────────────
+app.post('/api/admin/organizer-requests/:id/reject', requireAdmin, async (req, res) => {
+    try {
+        const { id } = req.params;
+        const request = await queryOne(
+            'SELECT * FROM organizer_request WHERE id = $1 LIMIT 1',
+            [id]
+        );
+        if (!request) return res.status(404).json({ error: 'Request not found' });
+        if (request.status !== 'pending') return res.status(400).json({ error: 'Request already reviewed' });
+
+        await query(`
+            UPDATE organizer_request
+            SET status = 'rejected', reviewed_at = NOW(), reviewed_by = $1
+            WHERE id = $2
+        `, [req.session.userUSN, id]);
+
+        res.json({ success: true, message: 'Request rejected' });
+    } catch (err) {
+        res.status(500).json({ error: 'Error rejecting request' });
+    }
+});
+
+// ─── Admin: Get all users ───────────────────────────────────────────────────────
+app.get('/api/admin/users', requireAdmin, async (req, res) => {
+    try {
+        const users = await query(`
+            SELECT s.usn, s.sname, s.sem, s.emailid, s.mobno, s.is_admin,
+                   COUNT(DISTINCT p.parteid) AS event_count,
+                   COUNT(DISTINCT v.volneid) AS volunteer_count
+            FROM student s
+            LEFT JOIN participant p ON s.usn = p.partusn
+            LEFT JOIN volunteer v ON s.usn = v.volnusn
+            GROUP BY s.usn, s.sname, s.sem, s.emailid, s.mobno, s.is_admin
+            ORDER BY s.sname ASC
+        `);
+        res.json({ users });
+    } catch (err) {
+        res.status(500).json({ error: 'Error fetching users' });
+    }
+});
+
+// ─── Admin: Get all events with revenue ────────────────────────────────────────
+app.get('/api/admin/events', requireAdmin, async (req, res) => {
+    try {
+        const events = await query(`
+            SELECT e.eid, e.ename, e.eventdate, e.eventloc, e.regfee,
+                   e.maxpart, e.maxvoln, e.orgusn,
+                   s.sname AS organizer_name,
+                   c.cname AS club_name,
+                   COUNT(DISTINCT p.partusn) AS participant_count,
+                   COUNT(DISTINCT v.volnusn) AS volunteer_count,
+                   COALESCE(SUM(CASE WHEN pay.status = 'verified' THEN pay.amount ELSE 0 END), 0) AS revenue
+            FROM event e
+            LEFT JOIN student s ON e.orgusn = s.usn
+            LEFT JOIN club c ON e.orgcid = c.cid
+            LEFT JOIN participant p ON e.eid = p.parteid
+            LEFT JOIN volunteer v ON e.eid = v.volneid
+            LEFT JOIN payment pay ON e.eid = pay.event_id
+            GROUP BY e.eid, e.ename, e.eventdate, e.eventloc, e.regfee,
+                     e.maxpart, e.maxvoln, e.orgusn, s.sname, c.cname
+            ORDER BY e.eventdate DESC
+        `);
+        res.json({ events });
+    } catch (err) {
+        res.status(500).json({ error: 'Error fetching events' });
+    }
+});
+
+// ─── Admin: Remove event ────────────────────────────────────────────────────────
+app.delete('/api/admin/events/:eventId', requireAdmin, async (req, res) => {
+    try {
+        const { eventId } = req.params;
+        await query('DELETE FROM event WHERE eid = $1', [eventId]);
+        res.json({ success: true, message: 'Event removed' });
+    } catch (err) {
+        res.status(500).json({ error: 'Error removing event' });
+    }
+});
+
+// ─── Admin: Get all organizers (approved) ──────────────────────────────────────
+app.get('/api/admin/organizers', requireAdmin, async (req, res) => {
+    try {
+        const organizers = await query(`
+            SELECT r.usn, r.college_name, r.club_name, r.role_in_club,
+                   r.college_email, r.approved_at,
+                   s.sname, s.emailid, s.sem,
+                   COUNT(DISTINCT e.eid) AS events_organized
+            FROM organizer_request r
+            JOIN student s ON r.usn = s.usn
+            LEFT JOIN event e ON e.orgusn = r.usn
+            WHERE r.status = 'approved'
+            GROUP BY r.usn, r.college_name, r.club_name, r.role_in_club,
+                     r.college_email, r.approved_at, s.sname, s.emailid, s.sem
+            ORDER BY s.sname ASC
+        `);
+        res.json({ organizers });
+    } catch (err) {
+        res.status(500).json({ error: 'Error fetching organizers' });
+    }
+});
+
+// ─── Admin: Revoke organizer (remove from club membership) ────────────────────
+app.post('/api/admin/organizers/:usn/revoke', requireAdmin, async (req, res) => {
+    try {
+        const { usn } = req.params;
+        // Mark request as rejected so they can't create events
+        await query(
+            "UPDATE organizer_request SET status = 'rejected' WHERE usn = $1",
+            [usn]
+        );
+        // Remove all club memberships
+        await query('DELETE FROM memberof WHERE studentusn = $1', [usn]);
+        res.json({ success: true, message: 'Organizer status revoked' });
+    } catch (err) {
+        res.status(500).json({ error: 'Error revoking organizer' });
+    }
+});
+
+// ─── Student: Submit organizer request ─────────────────────────────────────────
+app.post('/api/organizer-request', requireAuth, async (req, res) => {
+    try {
+        const { college_email, college_name, club_name, role_in_club } = req.body;
+        if (!college_email || !college_name || !club_name || !role_in_club) {
+            return res.status(400).json({ error: 'All fields are required' });
+        }
+
+        const existing = await queryOne(
+            'SELECT id, status FROM organizer_request WHERE usn = $1 LIMIT 1',
+            [req.session.userUSN]
+        );
+        if (existing) {
+            if (existing.status === 'pending') {
+                return res.status(400).json({ error: 'You already have a pending request' });
+            }
+            if (existing.status === 'approved') {
+                return res.status(400).json({ error: 'You are already an approved organizer' });
+            }
+            // Rejected — allow resubmission by updating
+            await query(`
+                UPDATE organizer_request
+                SET college_email = $1, college_name = $2, club_name = $3,
+                    role_in_club = $4, status = 'pending', created_at = NOW(),
+                    reviewed_at = NULL, reviewed_by = NULL
+                WHERE usn = $5
+            `, [college_email, college_name, club_name, role_in_club, req.session.userUSN]);
+            return res.json({ success: true, message: 'Request resubmitted successfully' });
+        }
+
+        await query(`
+            INSERT INTO organizer_request (usn, college_email, college_name, club_name, role_in_club, status, created_at)
+            VALUES ($1, $2, $3, $4, $5, 'pending', NOW())
+        `, [req.session.userUSN, college_email, college_name, club_name, role_in_club]);
+
+        res.status(201).json({ success: true, message: 'Request submitted! We will review it shortly.' });
+    } catch (err) {
+        res.status(500).json({ error: 'Error submitting request: ' + err.message });
+    }
+});
+
+// ─── Student: Check own organizer request status ───────────────────────────────
+app.get('/api/organizer-request/status', requireAuth, async (req, res) => {
+    try {
+        const request = await queryOne(
+            'SELECT id, status, created_at, college_name, club_name, role_in_club FROM organizer_request WHERE usn = $1 LIMIT 1',
+            [req.session.userUSN]
+        );
+        res.json({ request: request || null });
+    } catch (err) {
+        res.status(500).json({ error: 'Error fetching request status' });
+    }
+});
+
+
+
+// ============================================================
+// QUEUE SYSTEM ROUTES
+// Add these inside new_routes.js (before app.listen)
+// ============================================================
+
+// ── Helper: clean up expired queue entries ─────────────────────
+async function purgeExpiredQueue(eventId) {
+    await query(`
+        UPDATE registration_queue
+        SET status = 'expired'
+        WHERE event_id = $1
+          AND status = 'holding'
+          AND expires_at < NOW()
+    `, [eventId]);
+}
+
+// ── Helper: count truly occupied seats ─────────────────────────
+// Occupied = confirmed participants + active holding slots
+async function occupiedSeats(eventId) {
+    // Confirmed registrations (free or payment verified)
+    const confirmed = await queryCount(`
+        SELECT count(*) FROM participant
+        WHERE parteid = $1
+          AND payment_status IN ('free', 'verified', 'pending_verification')
+    `, [eventId]);
+
+    // Active holding slots (someone clicked Register but hasn't submitted TXN ID yet)
+    const holding = await queryCount(`
+        SELECT count(*) FROM registration_queue
+        WHERE event_id = $1
+          AND status = 'holding'
+          AND expires_at > NOW()
+    `, [eventId]);
+
+    return confirmed + holding;
+}
+
+// ── GET /api/events/:eventId/seat-status ───────────────────────
+// Frontend calls this to know: available / holding / queued / full
+app.get('/api/events/:eventId/seat-status', requireAuth, async (req, res) => {
+    try {
+        const eventId = parseInt(req.params.eventId);
+        const userUSN  = req.session.userUSN;
+
+        await purgeExpiredQueue(eventId);
+
+        const event = await queryOne(
+            'SELECT maxpart, regfee, is_team FROM event WHERE eid = $1 LIMIT 1',
+            [eventId]
+        );
+        if (!event) return res.status(404).json({ error: 'Event not found' });
+
+        const maxPart = event.maxpart || 0;
+
+        // Already registered?
+        const alreadyIn = await queryOne(
+            'SELECT payment_status FROM participant WHERE partusn = $1 AND parteid = $2 LIMIT 1',
+            [userUSN, eventId]
+        );
+        if (alreadyIn) return res.json({ status: 'registered', paymentStatus: alreadyIn.payment_status });
+
+        // Already in queue?
+        const mySlot = await queryOne(
+            'SELECT id, status, expires_at FROM registration_queue WHERE event_id = $1 AND usn = $2 LIMIT 1',
+            [eventId, userUSN]
+        );
+        if (mySlot && mySlot.status === 'holding') {
+            const secsLeft = Math.max(0, Math.ceil((new Date(mySlot.expires_at) - Date.now()) / 1000));
+            return res.json({ status: 'holding', expiresIn: secsLeft, queueId: mySlot.id });
+        }
+
+        if (maxPart === 0) return res.json({ status: 'available' });
+
+        const occupied = await occupiedSeats(eventId);
+        if (occupied < maxPart) return res.json({ status: 'available', remaining: maxPart - occupied });
+
+        // Check queue position
+        const queuePos = await queryCount(`
+            SELECT count(*) FROM registration_queue
+            WHERE event_id = $1
+              AND status = 'holding'
+              AND expires_at > NOW()
+              AND created_at < COALESCE(
+                (SELECT created_at FROM registration_queue WHERE event_id = $1 AND usn = $2 LIMIT 1),
+                NOW() + INTERVAL '1 year'
+              )
+        `, [eventId, userUSN]);
+
+        return res.json({
+            status: 'full',
+            queueLength: await queryCount(`
+                SELECT count(*) FROM registration_queue
+                WHERE event_id = $1 AND status = 'holding' AND expires_at > NOW()
+            `, [eventId]),
+        });
+    } catch (err) {
+        console.error('seat-status error:', err);
+        res.status(500).json({ error: 'Error checking seat status' });
+    }
+});
+
+// ── POST /api/events/:eventId/claim-seat ───────────────────────
+// Called when user clicks "Register" on a paid event.
+// Reserves their slot for HOLD_MINUTES before they submit TXN ID.
+const HOLD_MINUTES = 15;
+
+app.post('/api/events/:eventId/claim-seat', requireAuth, async (req, res) => {
+    try {
+        const eventId = parseInt(req.params.eventId);
+        const userUSN  = req.session.userUSN;
+
+        await purgeExpiredQueue(eventId);
+
+        const event = await queryOne(
+            'SELECT maxpart, regfee, orgusn, is_team FROM event WHERE eid = $1 LIMIT 1',
+            [eventId]
+        );
+        if (!event) return res.status(404).json({ error: 'Event not found' });
+        if (event.orgusn === userUSN) return res.status(403).json({ error: 'You cannot register in your own event' });
+        if ((event.regfee || 0) <= 0) return res.status(400).json({ error: 'Use the free registration flow for free events' });
+
+        // Already registered?
+        const alreadyIn = await queryOne(
+            'SELECT partusn FROM participant WHERE partusn = $1 AND parteid = $2 LIMIT 1',
+            [userUSN, eventId]
+        );
+        if (alreadyIn) return res.status(400).json({ error: 'You are already registered' });
+
+        // Already holding?
+        const existing = await queryOne(
+            'SELECT id, status, expires_at FROM registration_queue WHERE event_id = $1 AND usn = $2 LIMIT 1',
+            [eventId, userUSN]
+        );
+        if (existing && existing.status === 'holding' && new Date(existing.expires_at) > new Date()) {
+            const secsLeft = Math.ceil((new Date(existing.expires_at) - Date.now()) / 1000);
+            return res.json({ success: true, status: 'holding', expiresIn: secsLeft, queueId: existing.id, message: 'You already have an active seat hold' });
+        }
+
+        const maxPart = event.maxpart || 0;
+        if (maxPart > 0) {
+            const occupied = await occupiedSeats(eventId);
+            if (occupied >= maxPart) {
+                // Event full — put in queue
+                const expiresAt = new Date(Date.now() + HOLD_MINUTES * 60 * 1000);
+                const slot = await queryOne(`
+                    INSERT INTO registration_queue (event_id, usn, status, expires_at)
+                    VALUES ($1, $2, 'holding', $3)
+                    ON CONFLICT (event_id, usn) DO UPDATE
+                        SET status = 'holding', expires_at = $3, created_at = NOW()
+                    RETURNING id
+                `, [eventId, userUSN, expiresAt]);
+
+                const pos = await queryCount(`
+                    SELECT count(*) FROM registration_queue
+                    WHERE event_id = $1
+                      AND status = 'holding'
+                      AND expires_at > NOW()
+                      AND created_at <= (SELECT created_at FROM registration_queue WHERE id = $2 LIMIT 1)
+                `, [eventId, slot.id]);
+
+                return res.json({
+                    success: true,
+                    status: 'queued',
+                    queuePosition: pos,
+                    expiresIn: HOLD_MINUTES * 60,
+                    message: `Event is full. You are #${pos} in the queue. If a seat opens you will be notified here.`
+                });
+            }
+        }
+
+        // Seat available — create hold
+        const expiresAt = new Date(Date.now() + HOLD_MINUTES * 60 * 1000);
+        const slot = await queryOne(`
+            INSERT INTO registration_queue (event_id, usn, status, expires_at)
+            VALUES ($1, $2, 'holding', $3)
+            ON CONFLICT (event_id, usn) DO UPDATE
+                SET status = 'holding', expires_at = $3, created_at = NOW()
+            RETURNING id
+        `, [eventId, userUSN, expiresAt]);
+
+        res.json({
+            success: true,
+            status: 'holding',
+            queueId: slot.id,
+            expiresIn: HOLD_MINUTES * 60,
+            message: `Seat held for ${HOLD_MINUTES} minutes. Please complete payment before time runs out.`
+        });
+    } catch (err) {
+        console.error('claim-seat error:', err);
+        res.status(500).json({ error: 'Error claiming seat: ' + err.message });
+    }
+});
+
+// ── GET /api/events/:eventId/queue-position ────────────────────
+// Polling endpoint — frontend calls every 30s to check if
+// a queued person has been promoted to a real hold.
+app.get('/api/events/:eventId/queue-position', requireAuth, async (req, res) => {
+    try {
+        const eventId = parseInt(req.params.eventId);
+        const userUSN  = req.session.userUSN;
+
+        await purgeExpiredQueue(eventId);
+
+        const mySlot = await queryOne(
+            'SELECT id, status, expires_at FROM registration_queue WHERE event_id = $1 AND usn = $2 LIMIT 1',
+            [eventId, userUSN]
+        );
+
+        if (!mySlot || mySlot.status === 'expired') {
+            return res.json({ status: 'expired' });
+        }
+
+        if (mySlot.status === 'submitted') {
+            return res.json({ status: 'submitted' });
+        }
+
+        // Check if a seat has opened for this person (they're first in queue)
+        const event = await queryOne('SELECT maxpart FROM event WHERE eid = $1 LIMIT 1', [eventId]);
+        const maxPart = event?.maxpart || 0;
+
+        if (maxPart > 0) {
+            const occupied = await occupiedSeats(eventId);
+            if (occupied < maxPart) {
+                // Seat opened — they're promoted, update their expiry to give them 15 min from now
+                const newExpiry = new Date(Date.now() + HOLD_MINUTES * 60 * 1000);
+                await query(`
+                    UPDATE registration_queue SET expires_at = $1 WHERE id = $2
+                `, [newExpiry, mySlot.id]);
+                return res.json({
+                    status: 'holding',
+                    expiresIn: HOLD_MINUTES * 60,
+                    promoted: true,
+                    message: 'A seat just opened! You have 15 minutes to complete payment.'
+                });
+            }
+        }
+
+        // Still queued
+        const secsLeft = Math.max(0, Math.ceil((new Date(mySlot.expires_at) - Date.now()) / 1000));
+        const pos = await queryCount(`
+            SELECT count(*) FROM registration_queue
+            WHERE event_id = $1
+              AND status = 'holding'
+              AND expires_at > NOW()
+              AND created_at <= (SELECT created_at FROM registration_queue WHERE id = $2 LIMIT 1)
+        `, [eventId, mySlot.id]);
+
+        res.json({
+            status: secsLeft > 0 ? 'queued' : 'expired',
+            queuePosition: pos,
+            expiresIn: secsLeft
+        });
+    } catch (err) {
+        res.status(500).json({ error: 'Error checking queue position' });
+    }
+});
+
 
 app.listen(PORT, '0.0.0.0', () => {
     console.log('\n' + '─'.repeat(50));
