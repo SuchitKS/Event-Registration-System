@@ -4,7 +4,6 @@ import './AdminDashboard.css';
 
 const API_BASE = import.meta.env.VITE_API_URL || '';
 
-// ── Admin-specific fetch — always uses adminToken, never student token ──────────
 const adminFetch = (url, options = {}) => {
   const adminToken = localStorage.getItem('adminToken');
   return fetch(`${API_BASE}${url}`, {
@@ -28,12 +27,12 @@ const TABS = [
 export default function AdminDashboard() {
   const navigate = useNavigate();
 
-  // ── Auth state ─────────────────────────────────────────────────
-  const [adminAuth, setAdminAuth]       = useState(false);
-  const [authLoading, setAuthLoading]   = useState(true);
+  // ── Auth ───────────────────────────────────────────────────
+  const [adminAuth, setAdminAuth]         = useState(false);
+  const [authLoading, setAuthLoading]     = useState(true);
   const [adminPassword, setAdminPassword] = useState('');
 
-  // ── Data state ─────────────────────────────────────────────────
+  // ── Data ───────────────────────────────────────────────────
   const [activeTab, setActiveTab]           = useState('overview');
   const [stats, setStats]                   = useState(null);
   const [requests, setRequests]             = useState([]);
@@ -47,7 +46,11 @@ export default function AdminDashboard() {
   const [actionLoading, setActionLoading]   = useState({});
   const [toast, setToast]                   = useState({ show: false, message: '', isError: false });
 
-  // ── Helpers ────────────────────────────────────────────────────
+  // ── Role edit state ────────────────────────────────────────
+  const [editingRole, setEditingRole]       = useState(null); // { usn, role_in_club, club_name }
+  const [roleFormData, setRoleFormData]     = useState({ role_in_club: '', club_name: '' });
+
+  // ── Helpers ────────────────────────────────────────────────
   const showToast = (message, isError = false) => {
     setToast({ show: true, message, isError });
     setTimeout(() => setToast({ show: false, message: '', isError: false }), 4000);
@@ -59,7 +62,7 @@ export default function AdminDashboard() {
   const fmt = (d) =>
     d ? new Date(d).toLocaleDateString('en-IN', { day: '2-digit', month: 'short', year: 'numeric' }) : '—';
 
-  // ── Data fetchers (all use adminFetch) ─────────────────────────
+  // ── Fetchers ───────────────────────────────────────────────
   const fetchStats = useCallback(async () => {
     try {
       const res = await adminFetch('/api/admin/stats');
@@ -103,14 +106,22 @@ export default function AdminDashboard() {
   }, []);
 
   const fetchOrganizers = useCallback(async () => {
+    setTabLoading('organizers', true);
     try {
       const res = await adminFetch('/api/admin/organizers');
       if (res.ok) {
         const data = await res.json();
         setOrganizers(data.organizers || []);
+      } else {
+        console.error('Organizers fetch failed:', res.status);
+        setOrganizers([]);
       }
-    } catch (e) { console.error(e); }
-    finally { setTabLoading('organizers', false); }
+    } catch (e) {
+      console.error('Organizers fetch error:', e);
+      setOrganizers([]);
+    } finally {
+      setTabLoading('organizers', false);
+    }
   }, []);
 
   const fetchAllData = useCallback(() => {
@@ -121,20 +132,16 @@ export default function AdminDashboard() {
     fetchOrganizers();
   }, [fetchStats, fetchRequests, fetchEvents, fetchUsers, fetchOrganizers]);
 
-  // ── Initial Auth Check ─────────────────────────────────────────
-  // Only attempt check if an adminToken already exists in storage.
-  // This avoids sending a student token to /api/admin/check.
+  // ── Auth Check ─────────────────────────────────────────────
   useEffect(() => {
     const checkAdminStatus = async () => {
       try {
         const adminToken = localStorage.getItem('adminToken');
         if (!adminToken) {
-          // No admin token stored — skip the network call, show password gate
           setAdminAuth(false);
           setAuthLoading(false);
           return;
         }
-
         const res = await adminFetch('/api/admin/check');
         if (res.ok) {
           const data = await res.json();
@@ -144,7 +151,6 @@ export default function AdminDashboard() {
             return;
           }
         }
-        // Token invalid or expired — clear it
         localStorage.removeItem('adminToken');
         setAdminAuth(false);
       } catch {
@@ -153,11 +159,10 @@ export default function AdminDashboard() {
         setAuthLoading(false);
       }
     };
-
     checkAdminStatus();
   }, [fetchAllData]);
 
-  // ── Password Login ─────────────────────────────────────────────
+  // ── Password Login ─────────────────────────────────────────
   const handlePasswordSubmit = async (e) => {
     e.preventDefault();
     try {
@@ -168,19 +173,18 @@ export default function AdminDashboard() {
       });
       const data = await res.json();
       if (res.ok && data.token) {
-        // ✅ Store under 'adminToken' — never overwrites the student 'token'
         localStorage.setItem('adminToken', data.token);
         setAdminAuth(true);
         fetchAllData();
       } else {
         showToast(data.error || 'Incorrect admin password', true);
       }
-    } catch (err) {
+    } catch {
       showToast('Network error while logging in', true);
     }
   };
 
-  // ── Actions ────────────────────────────────────────────────────
+  // ── Actions ────────────────────────────────────────────────
   const handleApprove = async (id) => {
     setActionLoading(prev => ({ ...prev, [id]: 'approving' }));
     try {
@@ -241,14 +245,15 @@ export default function AdminDashboard() {
   };
 
   const handleRevokeOrganizer = async (usn, name) => {
-    if (!window.confirm(`Revoke organizer status for ${name}?`)) return;
-    setActionLoading(prev => ({ ...prev, [`org_${usn}`]: true }));
+    if (!window.confirm(`Revoke organizer status for ${name}? They will lose the ability to create events.`)) return;
+    setActionLoading(prev => ({ ...prev, [`org_${usn}`]: 'revoking' }));
     try {
       const res = await adminFetch(`/api/admin/organizers/${usn}/revoke`, { method: 'POST' });
       const data = await res.json();
       if (res.ok) {
         showToast('Organizer status revoked');
         fetchOrganizers();
+        fetchStats();
       } else {
         showToast(data.error || 'Failed', true);
       }
@@ -259,13 +264,46 @@ export default function AdminDashboard() {
     }
   };
 
-  // ✅ Only removes adminToken — student 'token' is untouched
+  const handleOpenRoleEdit = (org) => {
+    setEditingRole(org.usn);
+    setRoleFormData({ role_in_club: org.role_in_club || '', club_name: org.club_name || '' });
+  };
+
+  const handleSaveRole = async (usn) => {
+    if (!roleFormData.role_in_club.trim()) {
+      showToast('Role cannot be empty', true);
+      return;
+    }
+    setActionLoading(prev => ({ ...prev, [`role_${usn}`]: true }));
+    try {
+      const res = await adminFetch(`/api/admin/organizers/${usn}/update-role`, {
+        method: 'POST',
+        body: JSON.stringify({
+          role_in_club: roleFormData.role_in_club.trim(),
+          club_name: roleFormData.club_name.trim(),
+        }),
+      });
+      const data = await res.json();
+      if (res.ok) {
+        showToast('Role updated successfully');
+        setEditingRole(null);
+        fetchOrganizers();
+      } else {
+        showToast(data.error || 'Failed to update role', true);
+      }
+    } catch {
+      showToast('Network error', true);
+    } finally {
+      setActionLoading(prev => ({ ...prev, [`role_${usn}`]: null }));
+    }
+  };
+
   const handleLogout = () => {
     localStorage.removeItem('adminToken');
     navigate('/');
   };
 
-  // ── Render guards ──────────────────────────────────────────────
+  // ── Render guards ──────────────────────────────────────────
   if (authLoading) {
     return (
       <div className="adm-page">
@@ -276,13 +314,10 @@ export default function AdminDashboard() {
 
   if (!adminAuth) {
     return (
-      <div
-        className="adm-page"
-        style={{
-          display: 'flex', justifyContent: 'center', alignItems: 'center',
-          height: '100vh', background: '#F5EFE0',
-        }}
-      >
+      <div className="adm-page" style={{
+        display: 'flex', justifyContent: 'center', alignItems: 'center',
+        height: '100vh', background: '#F5EFE0',
+      }}>
         <div style={{
           background: '#fff', padding: '40px', border: '3px solid #0D0D0D',
           boxShadow: '8px 8px 0 #0D0D0D', maxWidth: '400px', width: '100%', textAlign: 'center',
@@ -290,7 +325,6 @@ export default function AdminDashboard() {
           <h2 style={{ fontFamily: '"Space Mono", monospace', textTransform: 'uppercase', marginBottom: '20px' }}>
             Admin Access
           </h2>
-
           {toast.show && (
             <div style={{
               color: toast.isError ? 'red' : 'green',
@@ -299,7 +333,6 @@ export default function AdminDashboard() {
               {toast.message}
             </div>
           )}
-
           <form onSubmit={handlePasswordSubmit}>
             <input
               type="password"
@@ -312,14 +345,11 @@ export default function AdminDashboard() {
                 boxSizing: 'border-box',
               }}
             />
-            <button
-              type="submit"
-              style={{
-                width: '100%', padding: '12px', background: '#FFD600',
-                color: '#000', border: '2px solid #000', fontWeight: 'bold',
-                cursor: 'pointer', fontFamily: '"Space Mono", monospace',
-              }}
-            >
+            <button type="submit" style={{
+              width: '100%', padding: '12px', background: '#FFD600',
+              color: '#000', border: '2px solid #000', fontWeight: 'bold',
+              cursor: 'pointer', fontFamily: '"Space Mono", monospace',
+            }}>
               ENTER DASHBOARD
             </button>
           </form>
@@ -328,7 +358,7 @@ export default function AdminDashboard() {
     );
   }
 
-  // ── Tab renderers ──────────────────────────────────────────────
+  // ── Tab renderers ──────────────────────────────────────────
   const renderOverview = () => (
     <div className="adm-overview">
       <div className="adm-section-title">Platform Overview</div>
@@ -540,11 +570,29 @@ export default function AdminDashboard() {
 
   const renderOrganizers = () => (
     <div className="adm-organizers">
-      <div className="adm-section-title">Approved Organisers</div>
+      <div className="adm-section-header">
+        <div className="adm-section-title">Approved Organisers</div>
+        <button
+          className="adm-refresh-btn"
+          onClick={fetchOrganizers}
+          disabled={loading.organizers}
+          title="Refresh list"
+        >
+          <i className={`fas fa-sync-alt ${loading.organizers ? 'fa-spin' : ''}`}></i>
+          Refresh
+        </button>
+      </div>
+
       {loading.organizers
         ? <div className="adm-loading"><div className="adm-spinner"></div></div>
         : organizers.length === 0
-          ? <div className="adm-empty">No approved organisers yet.</div>
+          ? (
+            <div className="adm-empty-state">
+              <div className="adm-empty-icon"><i className="fas fa-crown"></i></div>
+              <div className="adm-empty-title">No approved organisers yet</div>
+              <div className="adm-empty-sub">Approve requests from the Requests tab to see them here.</div>
+            </div>
+          )
           : (
             <div className="adm-request-list">
               {organizers.map(o => (
@@ -552,39 +600,107 @@ export default function AdminDashboard() {
                   <div className="adm-request-top">
                     <div className="adm-request-name">{o.sname}</div>
                     <div className="adm-request-usn">{o.usn}</div>
+                    <span className="adm-organizer-badge">
+                      <i className="fas fa-crown" style={{ fontSize: '9px', marginRight: '4px' }}></i>
+                      ORGANISER
+                    </span>
                   </div>
-                  <div className="adm-request-grid">
-                    <div className="adm-request-field">
-                      <span className="adm-field-key">Club</span>
-                      <span className="adm-field-val">{o.club_name}</span>
+
+                  {/* ── Role Edit Form (inline) ── */}
+                  {editingRole === o.usn ? (
+                    <div className="adm-role-edit-form">
+                      <div className="adm-role-edit-title">
+                        <i className="fas fa-edit" style={{ marginRight: '6px' }}></i>
+                        Edit Organiser Details
+                      </div>
+                      <div className="adm-role-edit-fields">
+                        <div className="adm-role-field-group">
+                          <label className="adm-field-key">Role in Club</label>
+                          <input
+                            className="adm-role-input"
+                            value={roleFormData.role_in_club}
+                            onChange={e => setRoleFormData(p => ({ ...p, role_in_club: e.target.value }))}
+                            placeholder="e.g. Vice President, Lead Coordinator"
+                          />
+                        </div>
+                        <div className="adm-role-field-group">
+                          <label className="adm-field-key">Club Name</label>
+                          <input
+                            className="adm-role-input"
+                            value={roleFormData.club_name}
+                            onChange={e => setRoleFormData(p => ({ ...p, club_name: e.target.value }))}
+                            placeholder="Club name"
+                          />
+                        </div>
+                      </div>
+                      <div className="adm-role-edit-actions">
+                        <button
+                          className="adm-approve-btn"
+                          onClick={() => handleSaveRole(o.usn)}
+                          disabled={!!actionLoading[`role_${o.usn}`]}
+                        >
+                          {actionLoading[`role_${o.usn}`] && <div className="adm-btn-spinner"></div>}
+                          Save Changes
+                        </button>
+                        <button
+                          className="adm-cancel-btn"
+                          onClick={() => setEditingRole(null)}
+                          disabled={!!actionLoading[`role_${o.usn}`]}
+                        >
+                          Cancel
+                        </button>
+                      </div>
                     </div>
-                    <div className="adm-request-field">
-                      <span className="adm-field-key">Role</span>
-                      <span className="adm-field-val">{o.role_in_club}</span>
+                  ) : (
+                    <div className="adm-request-grid">
+                      <div className="adm-request-field">
+                        <span className="adm-field-key">Club</span>
+                        <span className="adm-field-val">{o.club_name || '—'}</span>
+                      </div>
+                      <div className="adm-request-field">
+                        <span className="adm-field-key">Role</span>
+                        <span className="adm-field-val">{o.role_in_club || '—'}</span>
+                      </div>
+                      <div className="adm-request-field">
+                        <span className="adm-field-key">College</span>
+                        <span className="adm-field-val">{o.college_name || '—'}</span>
+                      </div>
+                      <div className="adm-request-field">
+                        <span className="adm-field-key">Events Organised</span>
+                        <span className="adm-field-val">{o.events_organized ?? 0}</span>
+                      </div>
+                      <div className="adm-request-field">
+                        <span className="adm-field-key">Email</span>
+                        <span className="adm-field-val">{o.emailid || '—'}</span>
+                      </div>
+                      <div className="adm-request-field">
+                        <span className="adm-field-key">Approved On</span>
+                        <span className="adm-field-val">{fmt(o.approved_at)}</span>
+                      </div>
                     </div>
-                    <div className="adm-request-field">
-                      <span className="adm-field-key">College</span>
-                      <span className="adm-field-val">{o.college_name}</span>
+                  )}
+
+                  {editingRole !== o.usn && (
+                    <div className="adm-request-actions">
+                      <button
+                        className="adm-edit-role-btn"
+                        onClick={() => handleOpenRoleEdit(o)}
+                        disabled={!!actionLoading[`org_${o.usn}`]}
+                        title="Edit role"
+                      >
+                        <i className="fas fa-edit"></i>
+                        Change Role
+                      </button>
+                      <button
+                        className="adm-reject-btn"
+                        onClick={() => handleRevokeOrganizer(o.usn, o.sname)}
+                        disabled={!!actionLoading[`org_${o.usn}`]}
+                      >
+                        {actionLoading[`org_${o.usn}`] === 'revoking' && <div className="adm-btn-spinner"></div>}
+                        Revoke Organiser
+                      </button>
                     </div>
-                    <div className="adm-request-field">
-                      <span className="adm-field-key">Events Organised</span>
-                      <span className="adm-field-val">{o.events_organized}</span>
-                    </div>
-                    <div className="adm-request-field">
-                      <span className="adm-field-key">Email</span>
-                      <span className="adm-field-val">{o.emailid}</span>
-                    </div>
-                  </div>
-                  <div className="adm-request-actions">
-                    <button
-                      className="adm-reject-btn"
-                      onClick={() => handleRevokeOrganizer(o.usn, o.sname)}
-                      disabled={!!actionLoading[`org_${o.usn}`]}
-                    >
-                      {actionLoading[`org_${o.usn}`] && <div className="adm-btn-spinner"></div>}
-                      Revoke Organiser
-                    </button>
-                  </div>
+                  )}
                 </div>
               ))}
             </div>
@@ -593,7 +709,7 @@ export default function AdminDashboard() {
     </div>
   );
 
-  // ── Main dashboard render ──────────────────────────────────────
+  // ── Main dashboard ─────────────────────────────────────────
   return (
     <div className="adm-page">
       <link rel="stylesheet" href="https://cdnjs.cloudflare.com/ajax/libs/font-awesome/6.4.2/css/all.min.css" />
@@ -605,13 +721,11 @@ export default function AdminDashboard() {
         </div>
       )}
 
-      {/* Sidebar */}
       <aside className="adm-sidebar">
         <div className="adm-sidebar-logo">
           <span className="adm-logo-flo">FLO●</span>
           <span className="adm-logo-tag">ADMIN</span>
         </div>
-
         <nav className="adm-nav">
           {TABS.map(t => (
             <button
@@ -627,13 +741,11 @@ export default function AdminDashboard() {
             </button>
           ))}
         </nav>
-
         <button className="adm-logout-btn" onClick={handleLogout}>
           <i className="fas fa-sign-out-alt"></i> Logout
         </button>
       </aside>
 
-      {/* Main content */}
       <main className="adm-main">
         <div className="adm-main-header">
           <div className="adm-breadcrumb">
@@ -642,7 +754,6 @@ export default function AdminDashboard() {
             <span className="adm-breadcrumb-cur">{TABS.find(t => t.id === activeTab)?.label}</span>
           </div>
         </div>
-
         <div className="adm-content">
           {activeTab === 'overview'   && renderOverview()}
           {activeTab === 'requests'   && renderRequests()}
