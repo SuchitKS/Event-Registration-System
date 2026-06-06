@@ -1,86 +1,140 @@
-// QueueStatus.jsx
-// Drop this file in frontend/src/
-// Used by Registerevent.jsx when event is full or seat is held
-
-import React, { useState, useEffect, useRef } from 'react';
+// QueueStatus.jsx — Drop-in replacement
+// Handles: holding (seat reserved), queued (waiting in line), promoted (moved up)
+import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { apiFetch } from './api.js';
 
-export default function QueueStatus({ eventId, eventName, onSeatAvailable, onExpired }) {
-  const [data, setData] = useState(null);
-  const [tick, setTick] = useState(0);
-  const intervalRef = useRef(null);
-  const pollRef = useRef(null);
+export default function QueueStatus({ eventId, initialData, onSeatAvailable, onExpired }) {
+  const [data, setData]         = useState(initialData || null);
+  const [secondsLeft, setSecondsLeft] = useState(initialData?.expiresIn || 0);
+  const pollRef   = useRef(null);
+  const timerRef  = useRef(null);
+  const mountedRef = useRef(true);
 
-  const poll = async () => {
+  // ── countdown tick ──────────────────────────────────────────
+  useEffect(() => {
+    timerRef.current = setInterval(() => {
+      setSecondsLeft(s => {
+        if (s <= 1) return 0;
+        return s - 1;
+      });
+    }, 1000);
+    return () => clearInterval(timerRef.current);
+  }, []);
+
+  // ── reset countdown whenever we get fresh data from server ──
+  useEffect(() => {
+    if (data?.expiresIn != null) {
+      setSecondsLeft(data.expiresIn);
+    }
+  }, [data]);
+
+  // ── poll server every 8s ────────────────────────────────────
+  const poll = useCallback(async () => {
+    if (!mountedRef.current) return;
     try {
       const res = await apiFetch(`/api/events/${eventId}/queue-position`);
       if (!res.ok) return;
       const d = await res.json();
+      if (!mountedRef.current) return;
+
+      if (d.status === 'expired') {
+        onExpired?.();
+        return;
+      }
+      if (d.status === 'submitted') {
+        return;
+      }
+      // Promoted from queue to holding
+      if (d.status === 'holding' && d.promoted) {
+        setData(d);
+        setSecondsLeft(d.expiresIn);
+        onSeatAvailable?.();
+        return;
+      }
       setData(d);
-
-      if (d.status === 'expired') { onExpired?.(); return; }
-      if (d.promoted && d.status === 'holding') { onSeatAvailable?.(d); }
     } catch (_) {}
-  };
+  }, [eventId, onSeatAvailable, onExpired]);
 
   useEffect(() => {
+    mountedRef.current = true;
+    // Poll immediately, then every 8 seconds
     poll();
-    // Poll every 20 seconds
-    pollRef.current = setInterval(poll, 20000);
-    // Tick every second for the countdown display
-    intervalRef.current = setInterval(() => setTick(t => t + 1), 1000);
+    pollRef.current = setInterval(poll, 8000);
     return () => {
+      mountedRef.current = false;
       clearInterval(pollRef.current);
-      clearInterval(intervalRef.current);
     };
-  }, [eventId]);
+  }, [poll]);
 
-  // Decrement local timer each tick
+  // ── expired via countdown ───────────────────────────────────
   useEffect(() => {
-    if (data && data.expiresIn > 0) {
-      setData(prev => prev ? { ...prev, expiresIn: Math.max(0, prev.expiresIn - 1) } : prev);
+    if (secondsLeft === 0 && data && data.status !== 'holding') {
+      // Give it one more server check before declaring expired
+      poll();
     }
-  }, [tick]);
+  }, [secondsLeft]);
 
-  if (!data) return null;
-
-  const mins = Math.floor((data.expiresIn || 0) / 60);
-  const secs = (data.expiresIn || 0) % 60;
+  // ── format timer ───────────────────────────────────────────
+  const mins = Math.floor(secondsLeft / 60);
+  const secs = secondsLeft % 60;
   const timeStr = `${mins}:${secs.toString().padStart(2, '0')}`;
 
-  if (data.status === 'holding' && !data.promoted) {
+  if (!data) {
     return (
       <div className="queue-status holding">
         <div className="queue-status-icon">⏳</div>
         <div className="queue-status-body">
-          <div className="queue-status-title">SEAT HELD</div>
-          <div className="queue-status-sub">Complete payment within <strong>{timeStr}</strong></div>
+          <div className="queue-status-title">CONNECTING…</div>
+          <div className="queue-status-sub">Checking your position…</div>
         </div>
       </div>
     );
   }
 
-  if (data.status === 'holding' && data.promoted) {
+  // ── HOLDING: seat is reserved for this user ─────────────────
+  if (data.status === 'holding') {
     return (
-      <div className="queue-status promoted">
-        <div className="queue-status-icon">🎉</div>
+      <div className="queue-status holding">
+        <div className="queue-status-icon">🎟️</div>
         <div className="queue-status-body">
-          <div className="queue-status-title">SEAT AVAILABLE!</div>
-          <div className="queue-status-sub">You moved up from the queue. Complete payment within <strong>{timeStr}</strong></div>
+          <div className="queue-status-title">SEAT RESERVED</div>
+          <div className="queue-status-sub">
+            Complete payment within <strong>{timeStr}</strong> or your seat will be released.
+          </div>
+          <div className="queue-status-timer">{timeStr}</div>
         </div>
       </div>
     );
   }
 
+  // ── QUEUED: waiting in line ─────────────────────────────────
   if (data.status === 'queued') {
+    const pos = data.queuePosition ?? '…';
     return (
       <div className="queue-status queued">
         <div className="queue-status-icon">🔢</div>
         <div className="queue-status-body">
-          <div className="queue-status-title">YOU ARE #{data.queuePosition} IN QUEUE</div>
+          <div className="queue-status-title">
+            YOU ARE <span className="queue-pos">#{pos}</span> IN QUEUE
+          </div>
           <div className="queue-status-sub">
-            The event is full right now. If a seat opens you will be notified here automatically.
-            Queue expires in <strong>{timeStr}</strong>.
+            The event is currently full. You'll be automatically moved up as seats open.
+            Keep this window open. Queue expires in <strong>{timeStr}</strong>.
+          </div>
+          <div className="queue-status-progress">
+            <div className="queue-status-progress-label">
+              <span>Position</span>
+              <span className="queue-pos-big">#{pos}</span>
+            </div>
+            <div className="queue-bar-track">
+              <div
+                className="queue-bar-fill"
+                style={{ width: pos === 1 ? '90%' : `${Math.max(5, 100 - (pos - 1) * 15)}%` }}
+              />
+            </div>
+            <div className="queue-status-hint">
+              Polling for updates every few seconds…
+            </div>
           </div>
         </div>
       </div>
