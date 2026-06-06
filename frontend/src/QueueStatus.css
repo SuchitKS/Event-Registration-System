@@ -1,15 +1,14 @@
-/* QueueStatus.css — add to your global styles or import in QueueStatus.jsx */
-
+/* QueueStatus.css — Full replacement */
 .queue-status {
   display: flex;
   align-items: flex-start;
-  gap: 12px;
-  padding: 14px 18px;
+  gap: 14px;
+  padding: 16px 20px;
   border: 3px solid #0a0a0a;
   font-family: 'Space Grotesk', sans-serif;
   margin: 12px 0;
   box-shadow: 4px 4px 0 #0a0a0a;
-  animation: qs-fadein 0.3s ease-out;
+  animation: qs-fadein 0.25s ease-out;
 }
 
 @keyframes qs-fadein {
@@ -17,33 +16,127 @@
   to   { opacity: 1; transform: translateY(0); }
 }
 
-.queue-status.holding  { background: #fffbe6; border-color: #FFE500; box-shadow: 4px 4px 0 #aa9900; }
-.queue-status.promoted { background: #e6fff4; border-color: #00cc66; box-shadow: 4px 4px 0 #007733; }
-.queue-status.queued   { background: #fff0e6; border-color: #ff8800; box-shadow: 4px 4px 0 #aa4400; }
+.queue-status.holding  {
+  background: #fffbe6;
+  border-color: #FFE500;
+  box-shadow: 4px 4px 0 #b8a200;
+}
+.queue-status.queued {
+  background: #fff4e6;
+  border-color: #ff8800;
+  box-shadow: 4px 4px 0 #b85e00;
+}
+.queue-status.promoted {
+  background: #e6fff4;
+  border-color: #00cc66;
+  box-shadow: 4px 4px 0 #007733;
+  animation: qs-fadein 0.3s ease-out, qs-pulse 0.6s ease-in-out;
+}
+
+@keyframes qs-pulse {
+  0%   { transform: scale(1); }
+  50%  { transform: scale(1.01); }
+  100% { transform: scale(1); }
+}
 
 .queue-status-icon {
-  font-size: 22px;
+  font-size: 24px;
   flex-shrink: 0;
   margin-top: 2px;
+  line-height: 1;
 }
 
 .queue-status-body {
   display: flex;
   flex-direction: column;
-  gap: 4px;
+  gap: 5px;
+  flex: 1;
 }
 
 .queue-status-title {
   font-family: 'Space Mono', monospace;
   font-size: 11px;
   font-weight: 700;
-  letter-spacing: 0.1em;
+  letter-spacing: 0.12em;
   text-transform: uppercase;
   color: #0a0a0a;
+  display: flex;
+  align-items: center;
+  gap: 6px;
+}
+
+.queue-pos {
+  font-size: 14px;
+  font-weight: 700;
+  color: #ff6600;
 }
 
 .queue-status-sub {
   font-size: 13px;
-  line-height: 1.5;
+  line-height: 1.55;
   color: #333;
+}
+
+.queue-status-timer {
+  font-family: 'Space Mono', monospace;
+  font-size: 22px;
+  font-weight: 700;
+  color: #0a0a0a;
+  letter-spacing: 0.04em;
+  margin-top: 4px;
+}
+
+/* ── Progress bar for queue position ── */
+.queue-status-progress {
+  margin-top: 10px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+}
+
+.queue-status-progress-label {
+  display: flex;
+  justify-content: space-between;
+  align-items: center;
+  font-family: 'Space Mono', monospace;
+  font-size: 10px;
+  font-weight: 700;
+  text-transform: uppercase;
+  letter-spacing: 0.08em;
+  color: #888;
+}
+
+.queue-pos-big {
+  font-size: 13px;
+  color: #ff6600;
+  font-weight: 700;
+}
+
+.queue-bar-track {
+  width: 100%;
+  height: 6px;
+  background: rgba(0,0,0,0.08);
+  border: 1.5px solid rgba(0,0,0,0.12);
+  border-radius: 0;
+  overflow: hidden;
+}
+
+.queue-bar-fill {
+  height: 100%;
+  background: #ff8800;
+  transition: width 0.8s ease-out;
+}
+
+.queue-status-hint {
+  font-family: 'Space Mono', monospace;
+  font-size: 9px;
+  color: #bbb;
+  letter-spacing: 0.06em;
+  text-transform: uppercase;
+  animation: qs-blink 2s ease-in-out infinite;
+}
+
+@keyframes qs-blink {
+  0%, 100% { opacity: 1; }
+  50%       { opacity: 0.4; }
 }
