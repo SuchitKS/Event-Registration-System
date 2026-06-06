@@ -1,34 +1,30 @@
-// QueueStatus.jsx — Drop-in replacement
-// Handles: holding (seat reserved), queued (waiting in line), promoted (moved up)
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { apiFetch } from './api.js';
 
 export default function QueueStatus({ eventId, initialData, onSeatAvailable, onExpired }) {
-  const [data, setData]         = useState(initialData || null);
+  const [data, setData]               = useState(initialData || null);
   const [secondsLeft, setSecondsLeft] = useState(initialData?.expiresIn || 0);
-  const pollRef   = useRef(null);
-  const timerRef  = useRef(null);
+  const pollRef    = useRef(null);
+  const timerRef   = useRef(null);
   const mountedRef = useRef(true);
+  // ── tracks latest status so the unmount closure can read it ──
+  const dataRef    = useRef(initialData || null);
 
-  // ── countdown tick ──────────────────────────────────────────
+  // ── countdown tick ────────────────────────────────────────────
   useEffect(() => {
     timerRef.current = setInterval(() => {
-      setSecondsLeft(s => {
-        if (s <= 1) return 0;
-        return s - 1;
-      });
+      setSecondsLeft(s => (s <= 1 ? 0 : s - 1));
     }, 1000);
     return () => clearInterval(timerRef.current);
   }, []);
 
-  // ── reset countdown whenever we get fresh data from server ──
+  // ── keep dataRef in sync + reset countdown on fresh server data
   useEffect(() => {
-    if (data?.expiresIn != null) {
-      setSecondsLeft(data.expiresIn);
-    }
+    dataRef.current = data;
+    if (data?.expiresIn != null) setSecondsLeft(data.expiresIn);
   }, [data]);
 
-  // ── poll server every 8s ────────────────────────────────────
+  // ── poll server every 8s ──────────────────────────────────────
   const poll = useCallback(async () => {
     if (!mountedRef.current) return;
     try {
@@ -37,14 +33,9 @@ export default function QueueStatus({ eventId, initialData, onSeatAvailable, onE
       const d = await res.json();
       if (!mountedRef.current) return;
 
-      if (d.status === 'expired') {
-        onExpired?.();
-        return;
-      }
-      if (d.status === 'submitted') {
-        return;
-      }
-      // Promoted from queue to holding
+      if (d.status === 'expired') { onExpired?.(); return; }
+      if (d.status === 'submitted') return;
+
       if (d.status === 'holding' && d.promoted) {
         setData(d);
         setSecondsLeft(d.expiresIn);
@@ -55,28 +46,40 @@ export default function QueueStatus({ eventId, initialData, onSeatAvailable, onE
     } catch (_) {}
   }, [eventId, onSeatAvailable, onExpired]);
 
+  // ── mount: start polling  |  unmount: smart cleanup ───────────
   useEffect(() => {
     mountedRef.current = true;
-    // Poll immediately, then every 8 seconds
     poll();
     pollRef.current = setInterval(poll, 8000);
+
     return () => {
       mountedRef.current = false;
       clearInterval(pollRef.current);
-    };
-  }, [poll]);
+      clearInterval(timerRef.current);   // ← was missing before
 
-  // ── expired via countdown ───────────────────────────────────
+      const current = dataRef.current;
+
+      // If user was only QUEUED (no seat held), release their spot
+      // immediately so the person behind them moves up right away.
+      // If they were HOLDING, do nothing — the UPI modal is about to
+      // open and they still need the 15-min window to pay.
+      if (current?.status === 'queued') {
+        apiFetch(`/api/events/${eventId}/release-queue`, { method: 'DELETE' })
+          .catch(() => {});            // fire-and-forget, ignore errors
+      }
+    };
+  }, [poll, eventId]);
+
+  // ── expired via countdown ─────────────────────────────────────
   useEffect(() => {
     if (secondsLeft === 0 && data && data.status !== 'holding') {
-      // Give it one more server check before declaring expired
       poll();
     }
   }, [secondsLeft]);
 
-  // ── format timer ───────────────────────────────────────────
-  const mins = Math.floor(secondsLeft / 60);
-  const secs = secondsLeft % 60;
+  // ── format timer ──────────────────────────────────────────────
+  const mins    = Math.floor(secondsLeft / 60);
+  const secs    = secondsLeft % 60;
   const timeStr = `${mins}:${secs.toString().padStart(2, '0')}`;
 
   if (!data) {
@@ -91,7 +94,7 @@ export default function QueueStatus({ eventId, initialData, onSeatAvailable, onE
     );
   }
 
-  // ── HOLDING: seat is reserved for this user ─────────────────
+  // ── HOLDING ───────────────────────────────────────────────────
   if (data.status === 'holding') {
     return (
       <div className="queue-status holding">
@@ -107,7 +110,7 @@ export default function QueueStatus({ eventId, initialData, onSeatAvailable, onE
     );
   }
 
-  // ── QUEUED: waiting in line ─────────────────────────────────
+  // ── QUEUED ────────────────────────────────────────────────────
   if (data.status === 'queued') {
     const pos = data.queuePosition ?? '…';
     return (
