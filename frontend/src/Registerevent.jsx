@@ -23,8 +23,6 @@ const SLIDER_CONSTANTS = {
 };
 
 const DEFAULT_COLORS = ["#1a1a2e", "#16213e", "#0f3460"];
-const CARD_WIDTH_MOBILE = 320;
-const CARD_GAP_MOBILE = 48;
 const MAX_VISIBLE_DOTS = 7;
 
 // ============================================================================
@@ -142,14 +140,8 @@ function useSliderNavigation({ totalSlides, enableKeyboard = true }) {
   return { currentIndex, setCurrentIndex, goToNext, goToPrev, goToSlide };
 }
 
-// ============================================================================
-// DRAG HOOK
-// ============================================================================
-
 function useSliderDrag({ trackRef, snapPointsRef, currentIndexRef, onSwipeLeft, onSwipeRight }) {
   const [isDragging, setIsDragging] = useState(false);
-
-  // All gesture state in refs — zero re-renders during drag
   const isDraggingRef    = useRef(false);
   const startXRef        = useRef(0);
   const startYRef        = useRef(0);
@@ -157,13 +149,11 @@ function useSliderDrag({ trackRef, snapPointsRef, currentIndexRef, onSwipeLeft, 
   const velocityRef      = useRef(0);
   const lastXRef         = useRef(0);
   const lastTimeRef      = useRef(0);
-  const directionLockedRef = useRef(null); // 'x' | 'y' | null
+  const directionLockedRef = useRef(null);
   const rafRef           = useRef(null);
-  const sliderNodeRef    = useRef(null);   // the actual DOM node
-
-  // Stable callback refs so touch handlers never need re-registering
-  const onSwipeLeftRef  = useRef(onSwipeLeft);
-  const onSwipeRightRef = useRef(onSwipeRight);
+  const sliderNodeRef    = useRef(null);
+  const onSwipeLeftRef   = useRef(onSwipeLeft);
+  const onSwipeRightRef  = useRef(onSwipeRight);
   useEffect(() => { onSwipeLeftRef.current  = onSwipeLeft;  }, [onSwipeLeft]);
   useEffect(() => { onSwipeRightRef.current = onSwipeRight; }, [onSwipeRight]);
 
@@ -185,16 +175,11 @@ function useSliderDrag({ trackRef, snapPointsRef, currentIndexRef, onSwipeLeft, 
   }, []);
 
   const handleStart = useCallback((clientX, clientY) => {
-    startXRef.current       = clientX;
-    startYRef.current       = clientY;
-    dragXRef.current        = 0;
-    lastXRef.current        = clientX;
-    lastTimeRef.current     = Date.now();
-    velocityRef.current     = 0;
-    directionLockedRef.current = null;
-    isDraggingRef.current   = true;
-    setIsDragging(true);
-    setTouchAction('pan-y');
+    startXRef.current = clientX; startYRef.current = clientY;
+    dragXRef.current = 0; lastXRef.current = clientX;
+    lastTimeRef.current = Date.now(); velocityRef.current = 0;
+    directionLockedRef.current = null; isDraggingRef.current = true;
+    setIsDragging(true); setTouchAction('pan-y');
     applyTransformRef.current(0, false);
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
   }, [setTouchAction]);
@@ -203,62 +188,40 @@ function useSliderDrag({ trackRef, snapPointsRef, currentIndexRef, onSwipeLeft, 
     if (!isDraggingRef.current) return;
     const dx = Math.abs(clientX - startXRef.current);
     const dy = Math.abs(clientY - startYRef.current);
-
     if (directionLockedRef.current === null) {
       if (dx < SLIDER_CONSTANTS.AXIS_LOCK_THRESHOLD && dy < SLIDER_CONSTANTS.AXIS_LOCK_THRESHOLD) return;
       directionLockedRef.current = dx > dy ? 'x' : 'y';
-
       if (directionLockedRef.current === 'x') {
         setTouchAction('none');
         if (event) { try { event.preventDefault(); } catch (e) {} }
       } else {
-        setTouchAction('pan-y');
-        isDraggingRef.current = false;
-        setIsDragging(false);
-        applyTransformRef.current(0, true);
-        return;
+        setTouchAction('pan-y'); isDraggingRef.current = false;
+        setIsDragging(false); applyTransformRef.current(0, true); return;
       }
     }
-
     if (directionLockedRef.current === 'y') return;
-
     if (event) { try { event.preventDefault(); } catch (e) {} }
-
-    const now = Date.now();
-    const dt  = now - lastTimeRef.current;
-    const rawDelta   = clientX - startXRef.current;
-    const maxPull    = 150;
-    const sign       = rawDelta > 0 ? 1 : -1;
-    const abs        = Math.abs(rawDelta);
-    const resisted   = abs > maxPull ? maxPull + (abs - maxPull) * 0.15 : abs;
+    const now = Date.now(); const dt = now - lastTimeRef.current;
+    const rawDelta = clientX - startXRef.current; const maxPull = 150;
+    const sign = rawDelta > 0 ? 1 : -1; const abs = Math.abs(rawDelta);
+    const resisted = abs > maxPull ? maxPull + (abs - maxPull) * 0.15 : abs;
     const resistedDragX = sign * resisted;
-
     if (dt > 0) velocityRef.current = (clientX - lastXRef.current) / dt;
-    lastXRef.current  = clientX;
-    lastTimeRef.current = now;
-    dragXRef.current  = resistedDragX;
-
+    lastXRef.current = clientX; lastTimeRef.current = now; dragXRef.current = resistedDragX;
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
-    rafRef.current = requestAnimationFrame(() => {
-      applyTransformRef.current(dragXRef.current, false);
-    });
+    rafRef.current = requestAnimationFrame(() => { applyTransformRef.current(dragXRef.current, false); });
   }, [setTouchAction]);
 
   const handleEnd = useCallback(() => {
     if (!isDraggingRef.current) return;
-    isDraggingRef.current = false;
-    setIsDragging(false);
+    isDraggingRef.current = false; setIsDragging(false);
     if (rafRef.current) cancelAnimationFrame(rafRef.current);
     setTouchAction('pan-y');
-
-    const dragX    = dragXRef.current;
-    const velocity = velocityRef.current;
+    const dragX = dragXRef.current; const velocity = velocityRef.current;
     const threshold = window.innerWidth * SLIDER_CONSTANTS.SWIPE_THRESHOLD_PERCENT;
     dragXRef.current = 0;
-
     const swipedLeft  = dragX < -threshold || velocity < -SLIDER_CONSTANTS.VELOCITY_THRESHOLD;
     const swipedRight = dragX >  threshold || velocity >  SLIDER_CONSTANTS.VELOCITY_THRESHOLD;
-
     if      (swipedLeft)  onSwipeLeftRef.current();
     else if (swipedRight) onSwipeRightRef.current();
     else                  applyTransformRef.current(0, true);
@@ -277,26 +240,13 @@ function useSliderDrag({ trackRef, snapPointsRef, currentIndexRef, onSwipeLeft, 
       old.removeEventListener('touchend',    old._onTouchEnd);
       old.removeEventListener('touchcancel', old._onTouchEnd);
     }
-
     sliderNodeRef.current = node;
     if (!node) return;
-
     node.style.touchAction = 'pan-y';
-
-    const onTouchStart = (e) => {
-      if (e.touches.length > 1) return;
-      handleStart(e.touches[0].clientX, e.touches[0].clientY);
-    };
-    const onTouchMove = (e) => {
-      if (e.touches.length > 1) return;
-      handleMove(e.touches[0].clientX, e.touches[0].clientY, e);
-    };
-    const onTouchEnd = () => handleEnd();
-
-    node._onTouchStart = onTouchStart;
-    node._onTouchMove  = onTouchMove;
-    node._onTouchEnd   = onTouchEnd;
-
+    const onTouchStart = (e) => { if (e.touches.length > 1) return; handleStart(e.touches[0].clientX, e.touches[0].clientY); };
+    const onTouchMove  = (e) => { if (e.touches.length > 1) return; handleMove(e.touches[0].clientX, e.touches[0].clientY, e); };
+    const onTouchEnd   = () => handleEnd();
+    node._onTouchStart = onTouchStart; node._onTouchMove = onTouchMove; node._onTouchEnd = onTouchEnd;
     node.addEventListener('touchstart',  onTouchStart, { passive: false });
     node.addEventListener('touchmove',   onTouchMove,  { passive: false });
     node.addEventListener('touchend',    onTouchEnd,   { passive: true  });
@@ -306,23 +256,16 @@ function useSliderDrag({ trackRef, snapPointsRef, currentIndexRef, onSwipeLeft, 
   return { isDragging, sliderCallbackRef, handleMouseDown, handleMouseMove, handleMouseUp, handleMouseLeave };
 }
 
-// ============================================================================
-// WHEEL HOOK
-// ============================================================================
-
 function useSliderWheel({ sliderRef, onScrollLeft, onScrollRight, enabled }) {
   const cooldownRef      = useRef(false);
   const cooldownTimerRef = useRef(null);
-
   useEffect(() => {
     if (!enabled) return;
     const slider = sliderRef.current;
     if (!slider) return;
-
     const handleWheel = (e) => {
       e.preventDefault();
-      const absDx = Math.abs(e.deltaX);
-      const absDy = Math.abs(e.deltaY);
+      const absDx = Math.abs(e.deltaX); const absDy = Math.abs(e.deltaY);
       if (absDx < SLIDER_CONSTANTS.WHEEL_MIN_DELTA && absDy < SLIDER_CONSTANTS.WHEEL_MIN_DELTA) return;
       const isHorizontallyDominant = absDx > absDy * SLIDER_CONSTANTS.AXIS_DOMINANCE_RATIO;
       const isPureHorizontal       = absDx > SLIDER_CONSTANTS.WHEEL_MIN_DELTA && absDy < 3;
@@ -333,7 +276,6 @@ function useSliderWheel({ sliderRef, onScrollLeft, onScrollRight, enabled }) {
       if (cooldownTimerRef.current) clearTimeout(cooldownTimerRef.current);
       cooldownTimerRef.current = setTimeout(() => { cooldownRef.current = false; }, SLIDER_CONSTANTS.WHEEL_DEBOUNCE_MS);
     };
-
     slider.addEventListener("wheel", handleWheel, { passive: false });
     return () => {
       slider.removeEventListener("wheel", handleWheel);
@@ -364,17 +306,12 @@ function useSnapPoints(trackRef, cardCount) {
       if (cards.length === 0) return;
       const prevTransition = track.style.transition;
       const prevTransform  = track.style.transform;
-      track.style.transition = 'none';
-      track.style.transform  = 'none';
+      track.style.transition = 'none'; track.style.transform = 'none';
       track.getBoundingClientRect();
       const vcx = window.innerWidth / 2;
-      const points = cards.map(card => {
-        const rect = card.getBoundingClientRect();
-        return vcx - (rect.left + rect.width / 2);
-      });
+      const points = cards.map(card => { const rect = card.getBoundingClientRect(); return vcx - (rect.left + rect.width / 2); });
       setSnapPoints(points);
-      track.style.transition = prevTransition;
-      track.style.transform  = prevTransform;
+      track.style.transition = prevTransition; track.style.transform = prevTransform;
     }
     const raf = requestAnimationFrame(measure);
     window.addEventListener('resize', measure);
@@ -541,24 +478,24 @@ function EventGalleryCard({ event, isActive, index, currentIndex, onOpen, render
 
 export default function Registerevent() {
   const navigate = useNavigate()
-  const [eventsData, setEventsData]           = useState({ upcoming:[], ongoing:[], completed:[] })
-  const [loading, setLoading]                 = useState(true)
-  const [filter, setFilter]                   = useState("all")
-  const [viewMode, setViewMode]               = useState("gallery")
-  const [teamStates, setTeamStates]           = useState({})
+  const [eventsData, setEventsData]             = useState({ upcoming:[], ongoing:[], completed:[] })
+  const [loading, setLoading]                   = useState(true)
+  const [filter, setFilter]                     = useState("all")
+  const [viewMode, setViewMode]                 = useState("gallery")
+  const [teamStates, setTeamStates]             = useState({})
   const [registeredEvents, setRegisteredEvents] = useState(new Set())
-  const [flash, setFlash]                     = useState({ type:"", message:"" })
-  const [modalFlash, setModalFlash]           = useState({ type:"", message:"" })
-  const [selectedEvent, setSelectedEvent]     = useState(null)
-  const [ticketInfo, setTicketInfo]           = useState(null)
-  const [showTeamModal, setShowTeamModal]     = useState(null)
-  const [teamFormData, setTeamFormData]       = useState({ teamName:'', memberUSNs:[''] })
-  const [teamInvites, setTeamInvites]         = useState([])
-  const [showUpiModal, setShowUpiModal]       = useState(null)
+  const [flash, setFlash]                       = useState({ type:"", message:"" })
+  const [modalFlash, setModalFlash]             = useState({ type:"", message:"" })
+  const [selectedEvent, setSelectedEvent]       = useState(null)
+  const [ticketInfo, setTicketInfo]             = useState(null)
+  const [showTeamModal, setShowTeamModal]       = useState(null)
+  const [teamFormData, setTeamFormData]         = useState({ teamName:'', memberUSNs:[''] })
+  const [teamInvites, setTeamInvites]           = useState([])
+  const [showUpiModal, setShowUpiModal]         = useState(null)
   const [activeQueueEvent, setActiveQueueEvent] = useState(null)
-  const [transactionId, setTransactionId]     = useState("")
-  const [isSubmitting, setIsSubmitting]       = useState(false)
-  const [qrCodeDataUrl, setQrCodeDataUrl]     = useState("")
+  const [transactionId, setTransactionId]       = useState("")
+  const [isSubmitting, setIsSubmitting]         = useState(false)
+  const [qrCodeDataUrl, setQrCodeDataUrl]       = useState("")
   const timerRef      = useRef(null)
   const modalTimerRef = useRef(null)
   const sliderDomRef  = useRef(null)
@@ -644,7 +581,7 @@ export default function Registerevent() {
     } else { setQrCodeDataUrl("") }
   }, [showUpiModal])
 
-  // ── Slider state ──────────────────────────────────────────────────────────
+  // ── Slider state ───────────────────────────────────────────────────────────
   const { currentIndex, goToNext, goToPrev, goToSlide } = useSliderNavigation({
     totalSlides: filteredEvents.length,
     enableKeyboard: !selectedEvent && !showTeamModal && !showUpiModal && !activeQueueEvent && viewMode==="gallery",
@@ -652,15 +589,13 @@ export default function Registerevent() {
 
   const trackRef = useRef(null);
   const snapPoints = useSnapPoints(trackRef, filteredEvents.length);
-
   const snapPointsRef   = useRef(snapPoints);
   const currentIndexRef = useRef(currentIndex);
-  useEffect(() => { snapPointsRef.current   = snapPoints;    }, [snapPoints]);
-  useEffect(() => { currentIndexRef.current = currentIndex;  }, [currentIndex]);
+  useEffect(() => { snapPointsRef.current   = snapPoints;   }, [snapPoints]);
+  useEffect(() => { currentIndexRef.current = currentIndex; }, [currentIndex]);
 
   const { isDragging, sliderCallbackRef, handleMouseDown, handleMouseMove, handleMouseUp, handleMouseLeave } = useSliderDrag({
-    trackRef, snapPointsRef, currentIndexRef,
-    onSwipeLeft: goToNext, onSwipeRight: goToPrev,
+    trackRef, snapPointsRef, currentIndexRef, onSwipeLeft: goToNext, onSwipeRight: goToPrev,
   });
 
   const combinedSliderRef = useCallback((node) => {
@@ -677,40 +612,55 @@ export default function Registerevent() {
   }, [currentIndex, snapPoints]);
 
   useSliderWheel({
-    sliderRef: sliderDomRef,
-    onScrollLeft:  goToNext,
-    onScrollRight: goToPrev,
+    sliderRef: sliderDomRef, onScrollLeft: goToNext, onScrollRight: goToPrev,
     enabled: !selectedEvent && !showTeamModal && !showUpiModal && !activeQueueEvent && viewMode==="gallery",
   });
 
-  const colorMap     = useColorExtraction(filteredEvents);
+  const colorMap      = useColorExtraction(filteredEvents);
   const currentColors = colorMap[filteredEvents[currentIndex]?.eid] || DEFAULT_COLORS;
 
   // ==================== ACTION HANDLERS ====================
 
+  // ── Register button click ──────────────────────────────────────────────────
+  // PAID events: go through queue/claim-seat flow → QueueStatus modal
+  // FREE events: go directly to /join → ticket animation (no queue needed)
   async function handleRegister(event) {
+    const isPaid = (event.regFee || 0) > 0;
+
+    if (!isPaid) {
+      // ── FREE event: direct join, no queue ──
+      try {
+        const r = await apiFetch(`/api/events/${event.eid}/join`, { method: "POST", headers: { "Content-Type": "application/json" } });
+        const d = await r.json();
+        if (!r.ok) { showFlash("error", d.error || "Failed to register"); return; }
+        showFlash("success", "Registered successfully!");
+        setRegisteredEvents(prev => new Set(prev).add(event.eid));
+        setTicketInfo({ eventName: event.ename, eventDate: event.eventDate, userUSN: d.userUSN || "AUTHORIZED" });
+        await loadEvents();
+      } catch {
+        showFlash("error", "Network error");
+      }
+      return;
+    }
+
+    // ── PAID event: claim-seat → queue/holding flow ──
     try {
       const r = await apiFetch(`/api/events/${event.eid}/claim-seat`, { method: "POST" });
       const d = await r.json();
       if (!r.ok) { showFlash("error", d.error || "Failed to claim seat"); return; }
-      
-      // Successfully entered queue or claimed seat, pop up the QueueStatus tracker
       setActiveQueueEvent({ event, claimData: d });
-    } catch { 
-      showFlash("error", "Network error claiming seat"); 
+    } catch {
+      showFlash("error", "Network error claiming seat");
     }
   }
 
-  // Called by QueueStatus when seat is successfully secured/promoted
+  // Called by QueueStatus when user is promoted from queued → holding
+  // and also when they already had a holding slot on first claim
   function handleSeatAvailable(event) {
     setActiveQueueEvent(null);
-    const hasFee = (event.regFee || 0) > 0;
-    if (hasFee) {
-      if (!event.upiId) { showFlash("error", "Payment not setup."); return; }
-      setTransactionId(""); setModalFlash({ type: "", message: "" }); setShowUpiModal({ event, isTeam: false });
-    } else {
-      executeJoin(event);
-    }
+    if (!event.upiId) { showFlash("error", "Payment not setup."); return; }
+    setTransactionId(""); setModalFlash({ type: "", message: "" });
+    setShowUpiModal({ event, isTeam: false });
   }
 
   function handleQueueExpired() {
@@ -718,7 +668,25 @@ export default function Registerevent() {
     showFlash("error", "Your seat reservation expired. Please try again.");
   }
 
-  // The actual registration logic (moved out from previous handleRegister)
+  // ── Close queue modal (× or overlay click) ────────────────────────────────
+  // QueueStatus itself calls release-queue on unmount when status=queued.
+  // For holding: seat stays held — UPI modal opens right after promotion anyway.
+  function handleCloseQueueModal() {
+    setActiveQueueEvent(null);
+    // release-queue is called inside QueueStatus cleanup (unmount effect)
+  }
+
+  // ── Close UPI modal without paying ────────────────────────────────────────
+  // Immediately releases holding slot so next person in queue can be promoted.
+  function handleCloseUpiModal() {
+    if (isSubmitting) return;
+    const { event } = showUpiModal;
+    // Fire-and-forget: release the holding slot
+    apiFetch(`/api/events/${event.eid}/release-holding`, { method: 'DELETE' }).catch(() => {});
+    setShowUpiModal(null);
+    setTransactionId("");
+  }
+
   async function executeJoin(event) {
     try {
       const r = await apiFetch(`/api/events/${event.eid}/join`, { method: "POST", headers: { "Content-Type": "application/json" } });
@@ -806,7 +774,9 @@ export default function Registerevent() {
     if (event.status==='completed')        return <button className="registerevent-btn disabled">Event Completed</button>
     if (!ts?.isTeamEvent) {
       if (registeredEvents.has(event.eid)) return <div className="registerevent-btn-group"><button className="registerevent-btn success" disabled>✓ Registered</button>{aboutBtn}</div>
-      return <div className="registerevent-btn-group"><button className="registerevent-btn primary" onClick={e=>{e.stopPropagation();handleRegister(event);}}>{(event.regFee||0)>0?`Pay ₹${event.regFee}`:"Register"}</button>{aboutBtn}</div>
+      const isPaid = (event.regFee || 0) > 0;
+      const btnLabel = isPaid ? `Pay ₹${event.regFee}` : "Register";
+      return <div className="registerevent-btn-group"><button className="registerevent-btn primary" onClick={e=>{e.stopPropagation();handleRegister(event);}}>{btnLabel}</button>{aboutBtn}</div>
     }
     if (ts.registrationComplete) return <div className="registerevent-btn-group"><button className="registerevent-btn success" disabled>✓ Team Registered</button>{aboutBtn}</div>
     if (ts.hasJoinedTeam) {
@@ -853,26 +823,26 @@ export default function Registerevent() {
   return (
     <main className="registerevent-page">
       {ticketInfo && <TicketAnimation onClose={()=>setTicketInfo(null)} {...ticketInfo} />}
-      
+
       {flash.message && (
         <div className={`flo-toast ${flash.type==='success'?'flo-toast--success':'flo-toast--error'}`}>
           <span className="flo-toast-icon">{flash.type==='success'?'✓':'✕'}</span>{flash.message}
         </div>
       )}
 
-      {/* Queue Modal Insertion point */}
+      {/* ── Queue Status Modal ── */}
       {activeQueueEvent && (
-        <div className="registerevent-modal-overlay" onClick={() => setActiveQueueEvent(null)}>
+        <div className="registerevent-modal-overlay" onClick={handleCloseQueueModal}>
           <div className="registerevent-modal" onClick={e => e.stopPropagation()}>
             <div className="registerevent-modal-header" style={{ marginBottom: "16px" }}>
               <h2 className="registerevent-modal-title">Queue Status</h2>
-              <button className="registerevent-modal-close" onClick={() => setActiveQueueEvent(null)}>×</button>
+              <button className="registerevent-modal-close" onClick={handleCloseQueueModal}>×</button>
             </div>
-            <QueueStatus 
-              eventId={activeQueueEvent.event.eid} 
+            <QueueStatus
+              eventId={activeQueueEvent.event.eid}
               initialData={activeQueueEvent.claimData}
-              onSeatAvailable={() => handleSeatAvailable(activeQueueEvent.event)} 
-              onExpired={handleQueueExpired} 
+              onSeatAvailable={() => handleSeatAvailable(activeQueueEvent.event)}
+              onExpired={handleQueueExpired}
             />
           </div>
         </div>
@@ -930,14 +900,8 @@ export default function Registerevent() {
       ) : filteredEvents.length===0 ? (
         <div className="re-gallery-empty"><span>No events found</span></div>
       ) : viewMode==="gallery" ? (
-        <div
-          ref={combinedSliderRef}
-          className={`re-gallery-slider ${isDragging?'dragging':''}`}
-          onMouseDown={handleMouseDown}
-          onMouseMove={handleMouseMove}
-          onMouseUp={handleMouseUp}
-          onMouseLeave={handleMouseLeave}
-        >
+        <div ref={combinedSliderRef} className={`re-gallery-slider ${isDragging?'dragging':''}`}
+          onMouseDown={handleMouseDown} onMouseMove={handleMouseMove} onMouseUp={handleMouseUp} onMouseLeave={handleMouseLeave}>
           <div ref={trackRef} className="re-gallery-track">
             {filteredEvents.map((event,index) => (
               <EventGalleryCard key={event.eid} event={event} isActive={index===currentIndex}
@@ -952,6 +916,7 @@ export default function Registerevent() {
       {!loading && filteredEvents.length>1 && viewMode==="gallery" && <NavigationDots total={filteredEvents.length} current={currentIndex} onSelect={goToSlide} />}
       {viewMode==="gallery" && <div className="re-gallery-keyboard-hint"><kbd>←</kbd><kbd>→</kbd><span>navigate</span></div>}
 
+      {/* ── Event detail overlay ── */}
       {selectedEvent && (
         <div className="registerevent-overlay-container">
           <div className="registerevent-overlay-split">
@@ -989,6 +954,7 @@ export default function Registerevent() {
         </div>
       )}
 
+      {/* ── Team modal ── */}
       {showTeamModal && (
         <div className="registerevent-modal-overlay" onClick={()=>setShowTeamModal(null)}>
           <div className="registerevent-modal" onClick={e=>e.stopPropagation()}>
@@ -1041,14 +1007,20 @@ export default function Registerevent() {
         </div>
       )}
 
+      {/* ── UPI Payment modal ── */}
       {showUpiModal && (
-        <div className="registerevent-modal-overlay" onClick={()=>!isSubmitting&&setShowUpiModal(null)}>
+        <div className="registerevent-modal-overlay" onClick={handleCloseUpiModal}>
           <div className="registerevent-modal" onClick={e=>e.stopPropagation()}>
             <div className="registerevent-modal-header">
               <h2 className="registerevent-modal-title">Pay & Register</h2>
-              <button className="registerevent-modal-close" disabled={isSubmitting} onClick={()=>setShowUpiModal(null)}>×</button>
+              <button className="registerevent-modal-close" disabled={isSubmitting} onClick={handleCloseUpiModal}>×</button>
             </div>
             <div className="registerevent-modal-body" style={{textAlign:'center'}}>
+              {modalFlash.message && (
+                <div className={`flo-toast ${modalFlash.type==='error'?"flo-toast--error":"flo-toast--success"}`} style={{position:'relative',top:0,left:0,transform:'none',width:'auto',marginBottom:'16px'}}>
+                  <span className="flo-toast-icon">{modalFlash.type==='error'?"✕":"✓"}</span>{modalFlash.message}
+                </div>
+              )}
               <div className="registerevent-qr-wrapper">{qrCodeDataUrl?<img src={qrCodeDataUrl} alt="QR" style={{display:'block',maxWidth:'100%'}}/>:<div className="registerevent-spinner" style={{margin:'40px auto'}}></div>}</div>
               <p style={{color:'var(--nb-black)',marginBottom:'20px',fontFamily:'var(--nb-font-mono)',fontSize:'13px',fontWeight:700}}>Pay <strong>₹{showUpiModal.event.regFee}</strong></p>
               <div className="registerevent-payment-details"><div className="registerevent-payment-row"><span style={{color:'#888'}}>UPI ID</span><span className="registerevent-payment-value">{showUpiModal.event.upiId}</span></div></div>
