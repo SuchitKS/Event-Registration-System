@@ -643,12 +643,21 @@ export default function Registerevent() {
       return;
     }
 
-    // ── PAID event: claim-seat → queue/holding flow ──
+    // ── PAID event: claim-seat → holding = go to UPI, queued = show queue modal ──
     try {
       const r = await apiFetch(`/api/events/${event.eid}/claim-seat`, { method: "POST" });
       const d = await r.json();
       if (!r.ok) { showFlash("error", d.error || "Failed to claim seat"); return; }
-      setActiveQueueEvent({ event, claimData: d });
+
+      if (d.status === 'holding') {
+        // Seat available immediately — open UPI payment modal directly
+        if (!event.upiId) { showFlash("error", "Payment not setup for this event."); return; }
+        setTransactionId(""); setModalFlash({ type: "", message: "" });
+        setShowUpiModal({ event, isTeam: false });
+      } else if (d.status === 'queued') {
+        // Event full — show queue position modal, wait for promotion
+        setActiveQueueEvent({ event, claimData: d });
+      }
     } catch {
       showFlash("error", "Network error claiming seat");
     }
