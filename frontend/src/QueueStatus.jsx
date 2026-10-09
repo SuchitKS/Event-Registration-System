@@ -118,6 +118,16 @@ export default function QueueStatus({ eventId, initialData, onSeatAvailable, onE
             Complete payment within <strong>{timeStr}</strong> or your seat will be released.
           </div>
           <div className="queue-status-timer">{timeStr}</div>
+          <button 
+            style={{ 
+              marginTop: '12px', padding: '10px 16px', background: '#0a0a0a', 
+              color: '#FFE500', fontWeight: 'bold', border: 'none', 
+              cursor: 'pointer', display: 'block', width: '100%', fontSize: '16px' 
+            }} 
+            onClick={() => cbRef.current.onSeatAvailable?.()}
+          >
+            PAY NOW
+          </button>
           {help}
         </div>
       </div>
