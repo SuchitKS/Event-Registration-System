@@ -32,7 +32,7 @@ cloudinary.config({
     api_secret: process.env.CLOUDINARY_API_SECRET,
 });
 
-const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024 } });
+const upload = multer({ storage: multer.memoryStorage(), limits: { fileSize: 5 * 1024 * 1024, fieldSize: 3 * 1024 * 1024 } });
 
 function uploadFromBuffer(buffer) {
     return new Promise((resolve, reject) => {
@@ -46,8 +46,19 @@ function uploadFromBuffer(buffer) {
 
 // ─── Brevo email ───────────────────────────────────────────────────────────────
 const apiInstance = new Brevo.TransactionalEmailsApi();
-const apiKey = apiInstance.authentications['apiKey'];
-apiKey.apiKey = process.env.BREVO_API_KEY;
+const BREVO_KEY = (process.env.BREVO_API_KEY || '').trim();
+if (!BREVO_KEY) console.error('❌ BREVO_API_KEY is missing. Check .env / host environment variables, then restart.');
+if (typeof apiInstance.setApiKey === 'function' && Brevo.TransactionalEmailsApiApiKeys) {
+    apiInstance.setApiKey(Brevo.TransactionalEmailsApiApiKeys.apiKey, BREVO_KEY);   // SDK v3+
+} else {
+    apiInstance.authentications['apiKey'].apiKey = BREVO_KEY;                        // SDK v2
+}
+
+// Sender must be a validated sender in Brevo (Gmail addresses are rejected).
+const MAIL_SENDER = {
+    name: 'FLO E-Pass System',
+    email: process.env.MAIL_SENDER_EMAIL || 'flopass333@10427433.brevosend.com',
+};
 
 // ─── Neon (pg) pool ────────────────────────────────────────────────────────────
 const pool = new Pool({
@@ -95,7 +106,490 @@ function extractDept(usn) {
 // ─── Express app ───────────────────────────────────────────────────────────────
 const app = express();
 app.use(helmet());
-app.use(express.json({ limit: '10kb' }));
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// SEATS, QUEUE & PAYMENT ENGINE
+// Strict first-come-first-served, one booking at a time per event, safe under load.
+// (Tested separately against a real Postgres: 60 seats/2 clicks, 2000 simultaneous clicks, reject/late rules.)
+// ═══════════════════════════════════════════════════════════════════════════════
+
+// ── Email: best-effort only. The website always shows the same information, so a
+//    failed or rate-limited email never blocks anything. ─────────────────────────
+const escapeHtml = (s) => String(s ?? '').replace(/[&<>"']/g, (c) => ({ '&': '&amp;', '<': '&lt;', '>': '&gt;', '"': '&quot;', "'": '&#39;' }[c]));
+const MAIL_RETRY_MAX = 200;
+const mailRetry = [];
+let mailPausedUntil = 0;
+
+async function sendMailSafe(mail) {
+    if (!mail || !mail.to) return false;
+    if (Date.now() < mailPausedUntil) { if (mailRetry.length < MAIL_RETRY_MAX) mailRetry.push(mail); return false; }
+    try {
+        const m = new Brevo.SendSmtpEmail();
+        m.subject = mail.subject;
+        m.sender = MAIL_SENDER;
+        m.to = [{ email: mail.to, name: mail.name || undefined }];
+        m.htmlContent = mail.html;
+        await apiInstance.sendTransacEmail(m);
+        return true;
+    } catch (err) {
+        const status = err?.status || err?.statusCode || err?.response?.status;
+        const text = JSON.stringify(err?.response?.body || err?.message || '').toLowerCase();
+        if (status === 429 || /quota|limit|credit/.test(text)) {
+            mailPausedUntil = Date.now() + 60 * 60 * 1000;
+            if (mailRetry.length < MAIL_RETRY_MAX) mailRetry.push(mail);
+            console.error('Email quota reached: pausing outgoing email for 1 hour (website still shows everything).');
+        } else {
+            console.error('Email failed (ignored):', err?.message || err);
+        }
+        return false;
+    }
+}
+async function flushMailRetry() {
+    if (Date.now() < mailPausedUntil) return;
+    for (let i = 0; i < 20 && mailRetry.length; i++) {
+        if (!(await sendMailSafe(mailRetry.shift()))) break;
+    }
+}
+const mailShell = (inner) => `<html><body style="font-family:Arial,sans-serif;background:#f5f0e8;padding:20px;">
+  <div style="max-width:500px;margin:0 auto;background:#fff;border:3px solid #0D0D0D;padding:28px;box-shadow:5px 5px 0 #0D0D0D;">
+  <h2 style="font-family:monospace;text-transform:uppercase;letter-spacing:2px;margin:0 0 8px;">FLO</h2>
+  <div style="height:4px;background:#FFD600;width:40px;margin-bottom:20px;"></div>${inner}</div></body></html>`;
+
+const seatNotify = {
+    // No email when a seat opens: the queue screen already updates by itself
+    // and moves the person straight to payment. (Saves email quota.)
+    seatOffered: () => {},
+    // organiser rejected a payment: email only when a reason was written
+    paymentRejected: (r) => { if (!r.reason) return; (async () => {
+        const s = await queryOne('SELECT sname, emailid FROM student WHERE usn = $1', [r.usn]);
+        if (!s?.emailid) return;
+        await sendMailSafe({ to: s.emailid, name: s.sname, subject: `Payment not accepted for ${r.eventName}`,
+            html: mailShell(`<p>Hello <strong>${escapeHtml(s.sname)}</strong>,</p>
+              <p>The organiser could not accept your payment for <strong>${escapeHtml(r.eventName)}</strong>.</p>
+              <p><strong>Reason:</strong> ${escapeHtml(r.reason)}</p>
+              <p>You can register again from the event page.</p>`) });
+    })().catch((e) => console.error('paymentRejected mail:', e.message)); },
+};
+
+/**
+ * Seat engine for Flo E-Pass.
+ *
+ * WHY THIS FILE EXISTS
+ *  The old code counted seats and then inserted a row in two separate steps with nothing
+ *  stopping two requests from interleaving. Under a launch-time rush that oversells events.
+ *  Here, every operation that can change who owns a seat runs inside withEventTx():
+ *    1. an in-process queue (cheap, holds no DB connection while waiting), then
+ *    2. a Postgres transaction that takes pg_advisory_xact_lock(event) (safe across several
+ *       server instances / restarts).
+ *  Inside that critical section the count and the insert can no longer be separated.
+ *
+ * SEAT STATES (registration_queue.status)
+ *   waiting    in line, no timer, ordered strictly by id (= arrival order inside the lock)
+ *   holding    offered a seat, HOLD_MINUTES to submit payment
+ *   submitted  payment submitted (participant row exists)
+ *   expired    hold ran out
+ *   rejected   organiser rejected the payment
+ *   cancelled  person left the line / closed the payment window
+ *
+ * SEATS TAKEN = participants (not rejected) + holds that have not expired.
+ */
+
+const HOLD_MINUTES = 15;
+const LOCK_NS = 7142;                 // advisory-lock namespace for this module
+const MAX_WAITERS_PER_EVENT = 1500;    // requests allowed to queue for one event's lock
+
+class SeatError extends Error {
+  constructor(status, message, extra = {}) {
+    super(message);
+    this.status = status;
+    this.extra = extra;
+  }
+}
+
+function createSeats({ pool, notify = {}, logger = console }) {
+  // ── in-process per-event mutex ────────────────────────────────────────────────
+  const tails = new Map();
+  const waiters = new Map();
+
+  function acquire(eventId) {
+    const n = waiters.get(eventId) || 0;
+    if (n >= MAX_WAITERS_PER_EVENT) {
+      throw new SeatError(503, 'Registration is very busy right now. Please try again in a few seconds.', { retry: true });
+    }
+    waiters.set(eventId, n + 1);
+    const prev = tails.get(eventId) || Promise.resolve();
+    let done;
+    const mine = new Promise((r) => { done = r; });
+    const tail = prev.then(() => mine);
+    tails.set(eventId, tail);
+    return prev.then(() => () => {
+      done();
+      const left = (waiters.get(eventId) || 1) - 1;
+      if (left <= 0) waiters.delete(eventId); else waiters.set(eventId, left);
+      if (tails.get(eventId) === tail) tails.delete(eventId);
+    });
+  }
+
+  async function withEventTx(eventId, fn) {
+    eventId = parseInt(eventId, 10);
+    if (!eventId) throw new SeatError(400, 'Invalid event ID');
+    const unlock = await acquire(eventId);
+    let client;
+    const ctx = { offered: [], rejected: null };
+    try {
+      client = await pool.connect();
+      await client.query('BEGIN');
+      await client.query('SELECT pg_advisory_xact_lock($1, $2)', [LOCK_NS, eventId]);
+      const result = await fn(client, ctx);
+      await client.query('COMMIT');
+      // side-effects only after the data is safely committed; never block the caller
+      try {
+        if (ctx.offered.length && notify.seatOffered) notify.seatOffered(ctx.offered);
+        if (ctx.rejected && notify.paymentRejected) notify.paymentRejected(ctx.rejected);
+      } catch (e) { logger.error('notify error (ignored):', e.message); }
+      return result;
+    } catch (err) {
+      if (client) { try { await client.query('ROLLBACK'); } catch (_) { /* ignore */ } }
+      throw err;
+    } finally {
+      if (client) client.release();
+      unlock();
+    }
+  }
+
+  // ── small helpers (all take the transaction client) ───────────────────────────
+  const rows = async (c, sql, p) => (await c.query(sql, p)).rows;
+  const one = async (c, sql, p) => (await c.query(sql, p)).rows[0] || null;
+
+  const getEvent = (c, eventId) => one(c, `
+    SELECT eid, ename, maxpart, maxvoln, regfee, orgusn, is_team,
+           (eventdate IS NOT NULL AND eventdate < (now() AT TIME ZONE 'Asia/Kolkata')::date) AS past
+    FROM event WHERE eid = $1`, [eventId]);
+
+  // One round trip: expires stale holds as a side effect and returns the two numbers that matter.
+  const state = (c, ev) => one(c, `
+    WITH exp AS (UPDATE registration_queue SET status = 'expired'
+                 WHERE event_id = $1 AND status = 'holding' AND expires_at <= now() RETURNING id)
+    SELECT (CASE WHEN $2 THEN
+              (SELECT count(DISTINCT team_id) FROM participant
+                WHERE parteid = $1 AND team_id IS NOT NULL AND payment_status IS DISTINCT FROM 'rejected')
+            ELSE
+              (SELECT count(*) FROM participant WHERE parteid = $1 AND payment_status IS DISTINCT FROM 'rejected')
+            + (SELECT count(*) FROM registration_queue WHERE event_id = $1 AND status = 'holding' AND expires_at > now())
+            END)::int AS taken,
+           (SELECT count(*) FROM registration_queue WHERE event_id = $1 AND status = 'waiting')::int AS waiting`,
+    [ev.eid, !!ev.is_team]);
+
+  // Offer free seats to the people at the front of the line, strictly in arrival order.
+  async function promote(c, ev, ctx, st) {
+    // once the event date has passed nobody can be offered a seat any more
+    if (!ev.maxpart || ev.maxpart <= 0 || ev.is_team || ev.past) return 0;
+    st = st || await state(c, ev);
+    const free = ev.maxpart - st.taken;
+    if (free <= 0 || st.waiting <= 0) return 0;
+    const got = await rows(c, `
+      UPDATE registration_queue SET status = 'holding', expires_at = now() + make_interval(mins => $3)
+      WHERE id IN (SELECT id FROM registration_queue WHERE event_id = $1 AND status = 'waiting'
+                   ORDER BY id LIMIT $2 FOR UPDATE)
+      RETURNING usn`, [ev.eid, free, HOLD_MINUTES]);
+    got.forEach((r) => ctx.offered.push({ eventId: ev.eid, eventName: ev.ename, usn: r.usn }));
+    st.taken += got.length; st.waiting -= got.length;
+    return got.length;
+  }
+
+  const positionOf = async (c, eventId, id) =>
+    (await one(c, `SELECT count(*)::int AS n FROM registration_queue WHERE event_id = $1 AND status = 'waiting' AND id <= $2`, [eventId, id])).n;
+
+  const myRow = (c, eventId, usn) => one(c, `
+    SELECT id, status, GREATEST(0, CEIL(EXTRACT(EPOCH FROM (expires_at - now()))))::int AS secs
+    FROM registration_queue WHERE event_id = $1 AND usn = $2 FOR UPDATE`, [eventId, usn]);
+
+  const assertCanRegister = async (c, ev, usn, { paid }) => {
+    if (!ev) throw new SeatError(404, 'Event not found');
+    if (ev.orgusn === usn) throw new SeatError(403, 'You cannot register in an event you are organizing');
+    if (ev.past) throw new SeatError(400, 'Registration is closed. This event has already taken place.');
+    if (paid === true && !(ev.regfee > 0)) throw new SeatError(400, 'Use the free registration flow for free events');
+    if (paid === false && ev.regfee > 0) throw new SeatError(400, 'This is a paid event. Please use the UPI payment flow.', { requiresPayment: true });
+    const vol = await one(c, 'SELECT 1 FROM volunteer WHERE volnusn = $1 AND volneid = $2', [usn, ev.eid]);
+    if (vol) throw new SeatError(403, 'You are already volunteering for this event. Volunteers cannot also register as participants.');
+    const part = await one(c, 'SELECT 1 FROM participant WHERE partusn = $1 AND parteid = $2', [usn, ev.eid]);
+    if (part) throw new SeatError(400, 'You are already registered for this event');
+  };
+
+  // ── PAID EVENTS ───────────────────────────────────────────────────────────────
+
+  /** Click "Register" on a paid event: get a hold, or join the back of the line. */
+  const claimSeat = async (eventId, usn) => {
+    // cheap checks BEFORE taking the lock, so the critical section stays tiny
+    const ev0 = await getEvent(pool, parseInt(eventId, 10));
+    await assertCanRegister(pool, ev0, usn, { paid: true });
+    if (ev0.is_team) throw new SeatError(400, 'Team events use team registration');
+
+    return withEventTx(eventId, async (c, ctx) => {
+      const ev = ev0;
+      const st = await state(c, ev);                 // expires stale holds, counts seats + line
+      await promote(c, ev, ctx, st);                 // fill free seats from the line FIRST
+
+      const mine = await myRow(c, ev.eid, usn);
+      if (mine) {
+        if (mine.status === 'holding') return { success: true, status: 'holding', queueId: mine.id, expiresIn: mine.secs };
+        if (mine.status === 'waiting') return { success: true, status: 'queued', queueId: mine.id, queuePosition: await positionOf(c, ev.eid, mine.id) };
+        await c.query('DELETE FROM registration_queue WHERE id = $1', [mine.id]);   // expired/rejected/cancelled: back of the line
+      }
+      const unlimited = !ev.maxpart || ev.maxpart <= 0;
+      if (unlimited || st.taken < ev.maxpart) {
+        const r = await one(c, `INSERT INTO registration_queue (event_id, usn, status, expires_at)
+          VALUES ($1, $2, 'holding', now() + make_interval(mins => $3)) RETURNING id`, [ev.eid, usn, HOLD_MINUTES]);
+        return { success: true, status: 'holding', queueId: r.id, expiresIn: HOLD_MINUTES * 60 };
+      }
+      const r = await one(c, `INSERT INTO registration_queue (event_id, usn, status, expires_at)
+        VALUES ($1, $2, 'waiting', NULL) RETURNING id`, [ev.eid, usn]);
+      return { success: true, status: 'queued', queueId: r.id, queuePosition: st.waiting + 1 };
+    });
+  };
+
+  /** Submit the UPI transaction id. Needs a live hold (or a late-but-still-free seat). */
+  const submitPayment = (eventId, usn, txnId) => withEventTx(eventId, async (c, ctx) => {
+    const ev = await getEvent(c, eventId);
+    if (!ev) throw new SeatError(404, 'Event not found');
+    if (ev.orgusn === usn) throw new SeatError(403, 'You cannot register in an event you organize');
+    if (!(ev.regfee > 0)) throw new SeatError(400, 'This is not a paid event');
+    if (ev.is_team) throw new SeatError(400, 'Team events use team registration');
+    const vol = await one(c, 'SELECT 1 FROM volunteer WHERE volnusn = $1 AND volneid = $2', [usn, ev.eid]);
+    if (vol) throw new SeatError(403, 'Volunteers cannot also register as participants.');
+    const part = await one(c, 'SELECT 1 FROM participant WHERE partusn = $1 AND parteid = $2', [usn, ev.eid]);
+    if (part) throw new SeatError(400, 'You are already registered for this event');
+
+    const st = await state(c, ev);
+    await promote(c, ev, ctx, st);
+
+    const mine = await myRow(c, ev.eid, usn);
+    if (!mine) throw new SeatError(403, 'Please click Register first to reserve a seat.', { code: 'NO_SEAT' });
+    if (mine.status === 'waiting') throw new SeatError(409, 'You are still in the queue. You will be offered a seat when one opens.', { code: 'IN_QUEUE' });
+    if (mine.status === 'submitted') throw new SeatError(409, 'Your payment is already submitted.');
+    if (mine.status === 'rejected' || mine.status === 'cancelled') {
+      throw new SeatError(403, 'Please click Register again to reserve a new seat.', { code: 'NO_SEAT' });
+    }
+
+    const confirm = async (late) => {
+      await c.query(`INSERT INTO participant (partusn, parteid, partstatus, payment_status)
+        VALUES ($1, $2, false, 'pending_verification')`, [usn, ev.eid]);
+      await c.query(`INSERT INTO payment (usn, event_id, amount, status, upi_transaction_id, late)
+        VALUES ($1, $2, $3, 'pending_verification', $4, $5)`, [usn, ev.eid, ev.regfee, txnId, late]);
+      await c.query(`UPDATE registration_queue SET status = 'submitted' WHERE id = $1`, [mine.id]);
+    };
+
+    if (mine.status === 'holding') {                 // normal path
+      await confirm(false);
+      return { success: true, late: false };
+    }
+
+    // mine.status === 'expired': the hold ran out before the payment was submitted
+    const unlimited = !ev.maxpart || ev.maxpart <= 0;
+    if (unlimited || st.taken < ev.maxpart) {
+      await confirm(true);                           // seat still free -> organiser decides
+      return { success: true, late: true };
+    }
+    const dup = await one(c, `SELECT 1 FROM payment WHERE usn = $1 AND event_id = $2 AND status = 'refund_needed'`, [usn, ev.eid]);
+    if (!dup) {
+      await c.query(`INSERT INTO payment (usn, event_id, amount, status, upi_transaction_id, late)
+        VALUES ($1, $2, $3, 'refund_needed', $4, true)`, [usn, ev.eid, ev.regfee, txnId]);
+    }
+    return { success: false, seatTaken: true };
+  });
+
+  /** Organiser rejects a pending payment. Frees the seat and offers it to the next person. */
+  const rejectPayment = ({ eventId, organiserUsn, targetUsn, reason }) => withEventTx(eventId, async (c, ctx) => {
+    const ev = await getEvent(c, eventId);
+    if (!ev) throw new SeatError(404, 'Event not found');
+    if (ev.orgusn !== organiserUsn) throw new SeatError(403, 'Not authorized to reject payments');
+    const cleanReason = String(reason || '').trim().slice(0, 300) || null;
+
+    const upd = await c.query(`UPDATE payment SET status = 'rejected', reject_reason = $3, reviewed_at = now()
+      WHERE event_id = $1 AND usn = $2 AND status = 'pending_verification'`, [ev.eid, targetUsn, cleanReason]);
+    if (upd.rowCount === 0) throw new SeatError(404, 'No pending payment found for this student');
+
+    if (ev.is_team) {
+      const team = await one(c, 'SELECT id FROM team WHERE event_id = $1 AND leader_usn = $2', [ev.eid, targetUsn]);
+      if (team) {
+        await c.query(`DELETE FROM participant WHERE parteid = $1 AND team_id = $2 AND payment_status = 'pending_verification'`, [ev.eid, team.id]);
+        await c.query('UPDATE team SET registration_complete = false WHERE id = $1', [team.id]);
+      }
+    } else {
+      await c.query(`DELETE FROM participant WHERE partusn = $1 AND parteid = $2 AND payment_status = 'pending_verification'`, [targetUsn, ev.eid]);
+      await c.query(`UPDATE registration_queue SET status = 'rejected' WHERE event_id = $1 AND usn = $2`, [ev.eid, targetUsn]);
+    }
+    await promote(c, ev, ctx);
+    ctx.rejected = { eventId: ev.eid, eventName: ev.ename, usn: targetUsn, reason: cleanReason };
+    return { success: true };
+  });
+
+  /** Leave the waiting line. */
+  const releaseQueue = (eventId, usn) => withEventTx(eventId, async (c) => {
+    await c.query(`DELETE FROM registration_queue WHERE event_id = $1 AND usn = $2 AND status = 'waiting'`, [eventId, usn]);
+    return { success: true };
+  });
+
+  /** Close the payment window without paying: give the seat back immediately. */
+  const releaseHolding = (eventId, usn) => withEventTx(eventId, async (c, ctx) => {
+    const ev = await getEvent(c, eventId);
+    if (!ev) throw new SeatError(404, 'Event not found');
+    const r = await c.query(`UPDATE registration_queue SET status = 'cancelled'
+      WHERE event_id = $1 AND usn = $2 AND status = 'holding'`, [ev.eid, usn]);
+    if (r.rowCount) await promote(c, ev, ctx);
+    return { success: true };
+  });
+
+  // ── FREE EVENTS / VOLUNTEERS ──────────────────────────────────────────────────
+
+  const joinFree = async (eventId, usn) => {
+    const ev = await getEvent(pool, parseInt(eventId, 10));
+    await assertCanRegister(pool, ev, usn, { paid: false });
+    if (ev.is_team) throw new SeatError(400, 'This is a team event. Please register as a team.');
+    return withEventTx(eventId, async (c) => {
+      const r = await c.query(`
+        INSERT INTO participant (partusn, parteid, partstatus, payment_status)
+        SELECT $1, $2, false, 'free'
+        WHERE $3 <= 0 OR (SELECT count(*) FROM participant WHERE parteid = $2 AND payment_status IS DISTINCT FROM 'rejected') < $3
+        RETURNING 1`, [usn, ev.eid, ev.maxpart || 0]);
+      if (r.rowCount === 0) throw new SeatError(400, 'No more participant slots available. The event is full.', { full: true });
+      return { success: true };
+    });
+  };
+
+  const joinVolunteer = (eventId, usn) => withEventTx(eventId, async (c) => {
+    const ev = await getEvent(c, eventId);
+    if (!ev) throw new SeatError(404, 'Event not found');
+    if (ev.orgusn === usn) throw new SeatError(403, 'You cannot volunteer for an event you are organizing');
+    if (await one(c, 'SELECT 1 FROM volunteer WHERE volnusn = $1 AND volneid = $2', [usn, ev.eid])) throw new SeatError(400, 'Already volunteered for this event');
+    if (await one(c, 'SELECT 1 FROM participant WHERE partusn = $1 AND parteid = $2', [usn, ev.eid])) {
+      throw new SeatError(403, 'You are already registered as a participant for this event. Participants cannot also volunteer.');
+    }
+    if (ev.maxvoln > 0) {
+      const n = (await one(c, 'SELECT count(*)::int AS n FROM volunteer WHERE volneid = $1', [ev.eid])).n;
+      if (n >= ev.maxvoln) throw new SeatError(400, 'No more volunteer slots available');
+    }
+    await c.query('INSERT INTO volunteer (volnusn, volneid, volnstatus) VALUES ($1, $2, false)', [usn, ev.eid]);
+    return { success: true };
+  });
+
+  /** Team routes keep their own logic but run it one-at-a-time per event (capacity check + insert). */
+  const exclusive = (eventId, fn) => withEventTx(eventId, (c, ctx) => fn(c, ctx));
+
+  /** Seats taken by teams (counts a team once). Used by the team routes. */
+  const teamsTaken = async (c, eventId, exceptTeamId = null) =>
+    (await one(c, `SELECT count(DISTINCT team_id)::int AS n FROM participant
+      WHERE parteid = $1 AND team_id IS NOT NULL AND payment_status IS DISTINCT FROM 'rejected'
+        AND ($2::int IS NULL OR team_id <> $2)`, [eventId, exceptTeamId])).n;
+
+  // ── READ-ONLY STATUS (what the page polls; no writes, one query) ──────────────
+
+  async function getStatus(eventId, usn) {
+    eventId = parseInt(eventId, 10);
+    const { rows: [r] } = await pool.query(`
+      SELECT
+        (SELECT payment_status FROM participant WHERE partusn = $2 AND parteid = $1) AS part_status,
+        (SELECT row_to_json(x) FROM (
+            SELECT q.id, q.status,
+                   GREATEST(0, CEIL(EXTRACT(EPOCH FROM (q.expires_at - now()))))::int AS secs,
+                   (SELECT count(*) FROM registration_queue w
+                     WHERE w.event_id = q.event_id AND w.status = 'waiting' AND w.id <= q.id)::int AS pos
+            FROM registration_queue q WHERE q.event_id = $1 AND q.usn = $2) x) AS q,
+        (SELECT row_to_json(p) FROM (
+            SELECT status, reject_reason FROM payment WHERE event_id = $1 AND usn = $2
+            ORDER BY created_at DESC LIMIT 1) p) AS pay,
+        (SELECT maxpart FROM event WHERE eid = $1) AS maxpart,
+        (SELECT count(*) FROM participant WHERE parteid = $1 AND payment_status IS DISTINCT FROM 'rejected')::int
+          + (SELECT count(*) FROM registration_queue WHERE event_id = $1 AND status = 'holding' AND expires_at > now())::int AS taken,
+        (SELECT count(*) FROM registration_queue WHERE event_id = $1 AND status = 'waiting')::int AS waiting`,
+      [eventId, usn]);
+
+    if (r.part_status) return { status: 'registered', paymentStatus: r.part_status };
+    const q = r.q;
+    if (q && q.status === 'holding' && q.secs > 0) return { status: 'holding', expiresIn: q.secs, queueId: q.id };
+    if (q && q.status === 'waiting') return { status: 'queued', queuePosition: q.pos, queueId: q.id };
+    if (q && (q.status === 'expired' || q.status === 'holding')) return { status: 'expired' };
+    if (r.pay && r.pay.status === 'rejected') return { status: 'rejected', reason: r.pay.reject_reason || null };
+    if (r.pay && r.pay.status === 'refund_needed') return { status: 'seat_taken' };
+    const max = r.maxpart || 0;
+    if (max > 0 && r.taken >= max) return { status: 'full', queueLength: r.waiting };
+    return { status: 'available', remaining: max > 0 ? max - r.taken : null };
+  }
+
+  /** Rejected / seat-taken payments the student should still see on the event page. */
+  async function getNotices(usn) {
+    const { rows } = await pool.query(`
+      SELECT DISTINCT ON (p.event_id) p.event_id AS "eventId", p.status, p.reject_reason AS reason, p.reviewed_at AS "at",
+             e.ename AS "eventName", e.contact_phone AS "contactPhone", e.contact_name AS "contactName"
+      FROM payment p JOIN event e ON e.eid = p.event_id
+      WHERE p.usn = $1 AND p.status IN ('rejected', 'refund_needed')
+        AND (e.eventdate IS NULL OR e.eventdate >= (now() AT TIME ZONE 'Asia/Kolkata')::date)
+        AND NOT EXISTS (SELECT 1 FROM participant pa WHERE pa.partusn = p.usn AND pa.parteid = p.event_id)
+        AND NOT EXISTS (SELECT 1 FROM payment p2 WHERE p2.usn = p.usn AND p2.event_id = p.event_id
+                          AND p2.created_at > p.created_at AND p2.status IN ('pending_verification', 'verified'))
+      ORDER BY p.event_id, p.created_at DESC`, [usn]);
+    return rows;
+  }
+
+  // ── BACKGROUND SWEEP: expire holds and offer freed seats to the front of the line ─
+  let sweeping = false;
+  async function sweep() {
+    if (sweeping) return;
+    sweeping = true;
+    try {
+      const { rows } = await pool.query(`SELECT DISTINCT event_id FROM registration_queue
+        WHERE status = 'waiting' OR (status = 'holding' AND expires_at <= now())`);
+      for (const { event_id } of rows) {
+        try {
+          await withEventTx(event_id, async (c, ctx) => {
+            const ev = await getEvent(c, event_id);
+            if (!ev) return;
+            if (ev.past) {                       // event is over: close the line so it is not re-checked forever
+              await state(c, ev);                // also marks stale holds as expired
+              await c.query(`UPDATE registration_queue SET status = 'cancelled' WHERE event_id = $1 AND status = 'waiting'`, [ev.eid]);
+              return;
+            }
+            await promote(c, ev, ctx);
+          });
+        } catch (e) { logger.error(`sweep event ${event_id}:`, e.message); }
+      }
+    } catch (e) {
+      logger.error('sweep error:', e.message);
+    } finally { sweeping = false; }
+  }
+  function startSweeper(ms = 20000) {
+    const t = setInterval(sweep, ms);
+    if (t.unref) t.unref();
+    sweep();
+    return t;
+  }
+
+  return {
+    HOLD_MINUTES, SeatError, withEventTx, exclusive, teamsTaken,
+    claimSeat, submitPayment, rejectPayment, releaseQueue, releaseHolding,
+    joinFree, joinVolunteer, getStatus, getNotices, sweep, startSweeper,
+  };
+}
+
+const seats = createSeats({ pool, notify: seatNotify, logger: console });
+
+function sendSeatError(res, err, fallback) {
+    if (err instanceof SeatError) return res.status(err.status).json({ error: err.message, ...err.extra });
+    console.error(fallback + ':', err);
+    return res.status(500).json({ error: fallback });
+}
+
+// per-student limit on booking actions (a double-click or script cannot hammer the engine)
+const seatLimiter = rateLimit({
+    windowMs: 60 * 1000, max: 20, standardHeaders: true, legacyHeaders: false,
+    keyGenerator: (req) => req.session.userUSN,
+    message: { error: 'Too many attempts. Please wait a minute and try again.' },
+});
+
+// Certificate designs contain small images, so that one route accepts a bigger body.
+const jsonSmall = express.json({ limit: '10kb' });
+const jsonCert  = express.json({ limit: '3mb' });
+app.use((req, res, next) => (/^\/api\/events\/\d+\/certificate-settings$/.test(req.path) ? jsonCert(req, res, next) : jsonSmall(req, res, next)));
 
 // ─── Logging Middleware ────────────────────────────────────────────────────────
 app.use((req, res, next) => {
@@ -415,7 +909,7 @@ app.post('/api/forgot-password', async (req, res) => {
             const resetLink = `${FRONTEND_URL_BASE}/reset-password?token=${resetToken}`;
             const sendSmtpEmail = new Brevo.SendSmtpEmail();
             sendSmtpEmail.subject = 'Reset Your FLO Password';
-            sendSmtpEmail.sender = { name: 'FLO E-Pass System', email: 'flobms3@gmail.com' };
+            sendSmtpEmail.sender = MAIL_SENDER;
             sendSmtpEmail.to = [{ email, name: student.sname }];
             sendSmtpEmail.htmlContent = `
                 <html><body style="font-family: Arial, sans-serif; background:#f5f0e8; padding:20px;">
@@ -428,8 +922,8 @@ app.post('/api/forgot-password', async (req, res) => {
                     <p style="color:#999;font-size:12px;margin-top:24px;">If you did not request this, ignore this email.</p>
                 </div></body></html>`;
             try {
-                await apiInstance.sendTransacEmail(sendSmtpEmail);
-                console.log(`✅ Password reset email sent to ${email}`);
+                const r = await apiInstance.sendTransacEmail(sendSmtpEmail);
+                console.log(`✅ Reset email accepted by Brevo for ${email}`, r?.body?.messageId || r?.messageId || '');
             } catch (e) {
                 console.error('❌ Brevo email error (forgot-password):', e?.response?.body || e?.message || e);
                 return res.status(500).json({ error: 'Failed to send reset email. Please try again later.' });
@@ -520,6 +1014,11 @@ app.get('/api/events', requireAuth, async (req, res) => {
         (rows || []).forEach(event => {
             const transformedEvent = {
                 ...event,
+                certificate_layout: undefined, volunteer_certificate_layout: undefined,
+                contactPhone: event.contact_phone || null, contactName: event.contact_name || null, whatsappLink: event.whatsapp_link || null,
+                volunteerCertificateMode: event.volunteer_certificate_mode || 'same',
+                certificateEnabled: !!event.certificate_enabled, certificateReleased: !!event.certificate_released,
+                certificateReleaseMode: event.certificate_release_mode || 'present',
                 eventDate: event.eventdate, eventTime: event.eventtime, eventLoc: event.eventloc,
                 maxPart: event.maxpart, maxVoln: event.maxvoln, regFee: event.regfee,
                 upiId: event.upi_id, posterUrl: event.poster_url, bannerUrl: event.banner_url,
@@ -557,6 +1056,11 @@ app.get('/api/events/:eventId', requireAuth, async (req, res) => {
 
         const transformedEvent = {
             ...event,
+            certificate_layout: undefined, volunteer_certificate_layout: undefined,
+            contactPhone: event.contact_phone || null, contactName: event.contact_name || null, whatsappLink: event.whatsapp_link || null,
+            volunteerCertificateMode: event.volunteer_certificate_mode || 'same',
+            certificateEnabled: !!event.certificate_enabled, certificateReleased: !!event.certificate_released,
+            certificateReleaseMode: event.certificate_release_mode || 'present',
             eventDate: event.eventdate, eventTime: event.eventtime, eventLoc: event.eventloc,
             maxPart: event.maxpart, maxVoln: event.maxvoln, regFee: event.regfee,
             upiId: event.upi_id, posterUrl: event.poster_url, bannerUrl: event.banner_url,
@@ -587,7 +1091,10 @@ app.post('/api/events/create', requireAuth, upload.single('banner'), async (req,
             eventDate, eventTime, eventLocation, maxParticipants, maxVolunteers,
             registrationFee, clubId, OrgCid, upiId, isTeamEvent,
             minTeamSize, maxTeamSize, activityPoints, maxActivityPts,
-            volActivityPts, minPartScans, minVolnScans
+            volActivityPts, minPartScans, minVolnScans,
+            certificate_enabled, certificate_template, certificate_layout,
+            contactPhone, contactName, whatsappLink,
+            volunteer_certificate_mode, volunteer_certificate_template, volunteer_certificate_layout
         } = req.body;
         const file = req.file;
         let finalBannerUrl = null;
@@ -617,13 +1124,44 @@ app.post('/api/events/create', requireAuth, upload.single('banner'), async (req,
             return res.status(400).json({ error: 'UPI ID is required for paid events' });
         }
 
+        const contactPhoneClean = String(contactPhone || '').replace(/\D/g, '').slice(-10);
+        if (!/^\d{10}$/.test(contactPhoneClean)) return res.status(400).json({ error: 'A valid 10-digit contact number for participants is required' });
+        const waLink = String(whatsappLink || '').trim();
+        if (waLink && !waLink.startsWith('https://chat.whatsapp.com/')) return res.status(400).json({ error: 'WhatsApp link must start with https://chat.whatsapp.com/' });
+        const volMode = ['none', 'same', 'separate'].includes(volunteer_certificate_mode) ? volunteer_certificate_mode : 'same';
+        const volTemplate = CERT_TEMPLATES.includes(volunteer_certificate_template) ? volunteer_certificate_template : null;
+        let volLayoutJson = null;
+        if (volMode === 'separate' && volunteer_certificate_layout) {
+            try {
+                const vp = JSON.parse(volunteer_certificate_layout);
+                if (!validCertLayout(vp)) return res.status(400).json({ error: 'Invalid or too large volunteer certificate layout' });
+                volLayoutJson = JSON.stringify(cleanCertLayout(vp));
+            } catch { return res.status(400).json({ error: 'Invalid volunteer certificate layout' }); }
+        }
+        const certEnabled = certificate_enabled === 'true' || certificate_enabled === true;
+        const certTemplate = CERT_TEMPLATES.includes(certificate_template) ? certificate_template : 'teal';
+        let certLayoutJson = null;
+        if (certEnabled && certificate_layout) {
+            try {
+                const parsed = JSON.parse(certificate_layout);
+                if (!validCertLayout(parsed)) return res.status(400).json({ error: 'Invalid or too large certificate layout' });
+                certLayoutJson = JSON.stringify(cleanCertLayout(parsed));
+            } catch { return res.status(400).json({ error: 'Invalid certificate layout' }); }
+        }
+
         const newEvent = await queryOne(`
             INSERT INTO event (
                 ename, eventdesc, certificate_info, poster_url, banner_url, eventdate, eventtime, eventloc,
                 maxpart, maxvoln, regfee, upi_id, orgusn, orgcid, is_team, min_team_size, max_team_size,
-                activity_points, max_activity_pts, vol_activity_pts, min_part_scans, min_voln_scans
+                activity_points, max_activity_pts, vol_activity_pts, min_part_scans, min_voln_scans,
+                certificate_enabled, certificate_template, certificate_layout,
+                contact_phone, contact_name, whatsapp_link,
+                volunteer_certificate_mode, volunteer_certificate_template, volunteer_certificate_layout
             ) VALUES (
-                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22
+                $1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15, $16, $17, $18, $19, $20, $21, $22,
+                $23, $24, $25::jsonb,
+                $26, $27, $28,
+                $29, $30, $31::jsonb
             ) RETURNING eid
         `, [
             eventName, eventDescription, certificate_info || null, posterUrl || null, finalBannerUrl,
@@ -631,7 +1169,10 @@ app.post('/api/events/create', requireAuth, upload.single('banner'), async (req,
             maxVolunteers ? parseInt(maxVolunteers) : null, fee, fee > 0 ? upiId : null,
             req.session.userUSN, organizedClubId || null, isTeam, isTeam ? (parseInt(minTeamSize) || null) : null,
             isTeam ? (parseInt(maxTeamSize) || null) : null, points, parseInt(maxActivityPts) || 0,
-            parseInt(volActivityPts) || 0, parseInt(minPartScans) || 1, parseInt(minVolnScans) || 1
+            parseInt(volActivityPts) || 0, parseInt(minPartScans) || 1, parseInt(minVolnScans) || 1,
+            certEnabled, certTemplate, certLayoutJson,
+            contactPhoneClean, String(contactName || '').trim().slice(0, 60) || null, waLink || null,
+            volMode, volTemplate, volLayoutJson
         ]);
 
         const newEventId = newEvent.eid;
@@ -643,6 +1184,159 @@ app.post('/api/events/create', requireAuth, upload.single('banner'), async (req,
     } catch (err) {
         console.error('Error creating event:', err);
         res.status(500).json({ error: `Error creating event: ${err.message}` });
+    }
+});
+
+// ─── Certificates (editor, release control, student download) ──────────────────
+const CERT_TEMPLATES = ['teal', 'orange'];
+const CERT_FONTS = ['Allura', 'Playfair', 'Meie', 'Cormorant'];
+const CERT_LAYOUT_MAX = 900 * 1024;
+
+const validCertLayout = (layout) =>
+    Array.isArray(layout) && layout.length > 0 && layout.length <= 60 &&
+    JSON.stringify(layout).length <= CERT_LAYOUT_MAX &&
+    layout.every(e => e && ['text', 'img', 'sig', 'line'].includes(e.t) && [e.x, e.y, e.w, e.h].every(n => Number.isFinite(+n)));
+
+// Whitelist every field so nothing unexpected is stored.
+const cleanCertLayout = (layout) => layout.map(e => ({
+    id: String(e.id || '').slice(0, 40),
+    t: e.t, x: +e.x, y: +e.y, w: +e.w, h: +e.h,
+    text: e.text == null ? undefined : String(e.text).slice(0, 2000),
+    name: e.name == null ? undefined : String(e.name).slice(0, 200),
+    desig: e.desig == null ? undefined : String(e.desig).slice(0, 200),
+    font: CERT_FONTS.includes(e.font) ? e.font : 'Cormorant',
+    size: Number.isFinite(+e.size) ? Math.min(12, Math.max(0.5, +e.size)) : 2,
+    color: /^#[0-9a-fA-F]{6}$/.test(e.color || '') ? e.color : '#000000',
+    al: ['left', 'center', 'right'].includes(e.al) ? e.al : 'center',
+    src: typeof e.src === 'string' && /^data:image\/(png|jpeg);base64,[A-Za-z0-9+/=]+$/.test(e.src) ? e.src : null,
+}));
+
+const CERT_COLS = `eid, ename, eventdate, orgusn, activity_points, max_activity_pts, certificate_info,
+    certificate_enabled, certificate_template, certificate_layout, certificate_released, certificate_release_mode,
+    volunteer_certificate_mode, volunteer_certificate_template, volunteer_certificate_layout, vol_activity_pts`;
+
+async function getOwnedCertEvent(req, res) {
+    const id = parseInt(req.params.eventId);
+    if (!id) { res.status(400).json({ error: 'Invalid event ID' }); return null; }
+    const ev = await queryOne(`SELECT ${CERT_COLS} FROM event WHERE eid = $1 LIMIT 1`, [id]);
+    if (!ev) { res.status(404).json({ error: 'Event not found' }); return null; }
+    if (ev.orgusn !== req.session.userUSN) { res.status(403).json({ error: 'Only the organiser can manage certificates' }); return null; }
+    return ev;
+}
+
+app.get('/api/events/:eventId/certificate-settings', requireAuth, async (req, res) => {
+    try {
+        const ev = await getOwnedCertEvent(req, res);
+        if (!ev) return;
+        const c = await queryOne(
+            `SELECT COUNT(*) FILTER (WHERE partstatus = true) AS present, COUNT(*) AS registered FROM participant WHERE parteid = $1`,
+            [ev.eid]);
+        res.json({
+            enabled: !!ev.certificate_enabled,
+            template: ev.certificate_template || 'teal',
+            layout: ev.certificate_layout || null,
+            released: !!ev.certificate_released,
+            releaseMode: ev.certificate_release_mode || 'present',
+            certificateInfo: ev.certificate_info || '',
+            volunteerMode: ev.volunteer_certificate_mode || 'same',
+            volunteerTemplate: ev.volunteer_certificate_template || null,
+            volunteerLayout: ev.volunteer_certificate_layout || null,
+            volPoints: ev.vol_activity_pts || 0,
+            points: ev.max_activity_pts || ev.activity_points || 0,
+            counts: { present: parseInt(c?.present) || 0, registered: parseInt(c?.registered) || 0 },
+        });
+    } catch (err) {
+        console.error('certificate-settings GET:', err);
+        res.status(500).json({ error: 'Error loading certificate settings' });
+    }
+});
+
+app.put('/api/events/:eventId/certificate-settings', requireAuth, express.json({ limit: '3mb' }), async (req, res) => {
+    try {
+        const ev = await getOwnedCertEvent(req, res);
+        if (!ev) return;
+        const { enabled, template, layout, released, releaseMode, certificateInfo, volunteerMode, volunteerTemplate, volunteerLayout } = req.body || {};
+        const sets = [], vals = [];
+        const add = (col, val, cast = '') => { vals.push(val); sets.push(`${col} = $${vals.length}${cast}`); };
+
+        if (typeof enabled === 'boolean') add('certificate_enabled', enabled);
+        if (template !== undefined) {
+            if (!CERT_TEMPLATES.includes(template)) return res.status(400).json({ error: 'Unknown template' });
+            add('certificate_template', template);
+        }
+        if (layout !== undefined) {
+            if (!validCertLayout(layout)) return res.status(400).json({ error: 'Invalid or too large certificate layout' });
+            add('certificate_layout', JSON.stringify(cleanCertLayout(layout)), '::jsonb');
+        }
+        if (volunteerMode !== undefined) {
+            if (!['none', 'same', 'separate'].includes(volunteerMode)) return res.status(400).json({ error: 'Invalid volunteer certificate option' });
+            add('volunteer_certificate_mode', volunteerMode);
+        }
+        if (volunteerTemplate !== undefined) {
+            if (volunteerTemplate !== null && !CERT_TEMPLATES.includes(volunteerTemplate)) return res.status(400).json({ error: 'Unknown volunteer template' });
+            add('volunteer_certificate_template', volunteerTemplate);
+        }
+        if (volunteerLayout !== undefined) {
+            if (volunteerLayout === null) add('volunteer_certificate_layout', null);
+            else {
+                if (!validCertLayout(volunteerLayout)) return res.status(400).json({ error: 'Invalid or too large volunteer certificate layout' });
+                add('volunteer_certificate_layout', JSON.stringify(cleanCertLayout(volunteerLayout)), '::jsonb');
+            }
+        }
+        if (typeof certificateInfo === 'string') add('certificate_info', certificateInfo.slice(0, 2000) || null);
+        if (typeof released === 'boolean') add('certificate_released', released);
+        if (releaseMode !== undefined) {
+            if (!['present', 'all'].includes(releaseMode)) return res.status(400).json({ error: 'Invalid release mode' });
+            add('certificate_release_mode', releaseMode);
+        }
+        if (!sets.length) return res.json({ success: true });
+        vals.push(ev.eid);
+        await query(`UPDATE event SET ${sets.join(', ')} WHERE eid = $${vals.length}`, vals);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('certificate-settings PUT:', err);
+        res.status(500).json({ error: 'Error saving certificate settings' });
+    }
+});
+
+// Student: returns the layout only if the organiser released it and the student is eligible.
+app.get('/api/events/:eventId/certificate', requireAuth, async (req, res) => {
+    try {
+        const id = parseInt(req.params.eventId);
+        if (!id) return res.status(400).json({ error: 'Invalid event ID' });
+        const usn = req.session.userUSN;
+        const ev = await queryOne(`SELECT ${CERT_COLS} FROM event WHERE eid = $1 LIMIT 1`, [id]);
+        if (!ev || !ev.certificate_enabled) return res.status(404).json({ error: 'This event has no certificate' });
+        if (!ev.certificate_released) return res.status(403).json({ error: 'Certificates have not been released yet' });
+
+        const part = await queryOne('SELECT partstatus FROM participant WHERE partusn = $1 AND parteid = $2 LIMIT 1', [usn, id]);
+        if (part) {
+            if (ev.certificate_release_mode !== 'all' && part.partstatus != true) {
+                return res.status(403).json({ error: 'Certificates are released only to students marked present' });
+            }
+            return res.json({ role: 'participant', template: ev.certificate_template || 'teal', layout: ev.certificate_layout || null, certificateInfo: ev.certificate_info || '' });
+        }
+
+        const vol = await queryOne('SELECT volnstatus FROM volunteer WHERE volnusn = $1 AND volneid = $2 LIMIT 1', [usn, id]);
+        if (vol) {
+            const mode = ev.volunteer_certificate_mode || 'same';
+            if (mode === 'none') return res.status(404).json({ error: 'This event has no certificate for volunteers' });
+            if (ev.certificate_release_mode !== 'all' && vol.volnstatus != true) {
+                return res.status(403).json({ error: 'Certificates are released only to volunteers marked present' });
+            }
+            const separate = mode === 'separate' && ev.volunteer_certificate_layout;
+            return res.json({
+                role: 'volunteer',
+                template: separate ? (ev.volunteer_certificate_template || ev.certificate_template || 'teal') : (ev.certificate_template || 'teal'),
+                layout: separate ? ev.volunteer_certificate_layout : (ev.certificate_layout || null),
+                certificateInfo: ev.certificate_info || '',
+                points: ev.vol_activity_pts || 0,
+            });
+        }
+        return res.status(403).json({ error: 'You were not registered for this event' });
+    } catch (err) {
+        console.error('certificate GET:', err);
+        res.status(500).json({ error: 'Error loading certificate' });
     }
 });
 
@@ -674,6 +1368,11 @@ app.get('/api/my-participant-events', requireAuth, async (req, res) => {
             }
             transformedEvents.push({
                 ...e,
+                certificate_layout: undefined, volunteer_certificate_layout: undefined,
+                contactPhone: e.contact_phone || null, contactName: e.contact_name || null, whatsappLink: e.whatsapp_link || null,
+                volunteerCertificateMode: e.volunteer_certificate_mode || 'same',
+                certificateEnabled: !!e.certificate_enabled, certificateReleased: !!e.certificate_released,
+                certificateReleaseMode: e.certificate_release_mode || 'present',
                 eventDate: e.eventdate, eventTime: e.eventtime, eventLoc: e.eventloc,
                 maxPart: e.maxpart, maxVoln: e.maxvoln, regFee: e.regfee,
                 posterUrl: e.poster_url, bannerUrl: e.banner_url,
@@ -704,6 +1403,11 @@ app.get('/api/my-volunteer-events', requireAuth, async (req, res) => {
             const volActivityPts = e.vol_activity_pts || 0;
             return {
                 ...e,
+                certificate_layout: undefined, volunteer_certificate_layout: undefined,
+                contactPhone: e.contact_phone || null, contactName: e.contact_name || null, whatsappLink: e.whatsapp_link || null,
+                volunteerCertificateMode: e.volunteer_certificate_mode || 'same',
+                certificateEnabled: !!e.certificate_enabled, certificateReleased: !!e.certificate_released,
+                certificateReleaseMode: e.certificate_release_mode || 'present',
                 eventDate: e.eventdate, eventTime: e.eventtime, eventLoc: e.eventloc,
                 maxPart: e.maxpart, maxVoln: e.maxvoln, regFee: e.regfee,
                 posterUrl: e.poster_url, bannerUrl: e.banner_url,
@@ -729,6 +1433,11 @@ app.get('/api/my-organized-events', requireAuth, async (req, res) => {
 
         const transformedEvents = organizerEvents.map(e => ({
             ...e,
+            certificate_layout: undefined, volunteer_certificate_layout: undefined,
+            contactPhone: e.contact_phone || null, contactName: e.contact_name || null, whatsappLink: e.whatsapp_link || null,
+            volunteerCertificateMode: e.volunteer_certificate_mode || 'same',
+            certificateEnabled: !!e.certificate_enabled, certificateReleased: !!e.certificate_released,
+            certificateReleaseMode: e.certificate_release_mode || 'present',
             eventDate: e.eventdate, eventTime: e.eventtime, eventLoc: e.eventloc,
             maxPart: e.maxpart, maxVoln: e.maxvoln, regFee: e.regfee,
             upiId: e.upi_id, posterUrl: e.poster_url, bannerUrl: e.banner_url,
@@ -740,62 +1449,18 @@ app.get('/api/my-organized-events', requireAuth, async (req, res) => {
     }
 });
 
-app.post('/api/events/:eventId/join', requireAuth, async (req, res) => {
+app.post('/api/events/:eventId/join', requireAuth, seatLimiter, async (req, res) => {
     try {
-        const eventId = req.params.eventId;
-        const userUSN = req.session.userUSN;
-
-        const existing = await queryOne('SELECT * FROM participant WHERE partusn = $1 AND parteid = $2 LIMIT 1', [userUSN, eventId]);
-        if (existing) return res.status(400).json({ error: 'Already joined this event' });
-
-        const event = await queryOne('SELECT maxpart, regfee, orgusn FROM event WHERE eid = $1 LIMIT 1', [eventId]);
-        if (!event) return res.status(404).json({ error: 'Event not found' });
-        if (event.orgusn === userUSN) return res.status(403).json({ error: 'You cannot register as a participant in an event you are organizing' });
-
-        const volCheck = await queryOne('SELECT volnusn FROM volunteer WHERE volnusn = $1 AND volneid = $2 LIMIT 1', [userUSN, eventId]);
-        if (volCheck) return res.status(403).json({ error: 'You are already volunteering for this event. Volunteers cannot also register as participants.' });
-
-        const regFee = event.regfee || 0;
-        if (regFee > 0) return res.status(400).json({ error: 'This is a paid event. Please use the UPI payment flow.', requiresPayment: true });
-
-        const maxPart = event.maxpart || 0;
-        if (maxPart > 0) {
-            const count = await queryCount('SELECT count(*) FROM participant WHERE parteid = $1', [eventId]);
-            if (count >= maxPart) return res.status(400).json({ error: 'No more participant slots available' });
-        }
-
-        await query('INSERT INTO participant (partusn, parteid, partstatus, payment_status) VALUES ($1, $2, false, $3)', [userUSN, eventId, 'free']);
-        res.json({ success: true, message: 'Successfully joined event!', userUSN });
-    } catch (err) {
-        res.status(500).json({ error: 'Error joining event' });
-    }
+        await seats.joinFree(req.params.eventId, req.session.userUSN);
+        res.json({ success: true, message: 'Successfully joined event!', userUSN: req.session.userUSN });
+    } catch (err) { sendSeatError(res, err, 'Error joining event'); }
 });
 
-app.post('/api/events/:eventId/volunteer', requireAuth, async (req, res) => {
+app.post('/api/events/:eventId/volunteer', requireAuth, seatLimiter, async (req, res) => {
     try {
-        const eventId = req.params.eventId;
-        const userUSN = req.session.userUSN;
-
-        const existing = await queryOne('SELECT * FROM volunteer WHERE volnusn = $1 AND volneid = $2 LIMIT 1', [userUSN, eventId]);
-        if (existing) return res.status(400).json({ error: 'Already volunteered for this event' });
-
-        const event = await queryOne('SELECT maxvoln FROM event WHERE eid = $1 LIMIT 1', [eventId]);
-        if (!event) return res.status(404).json({ error: 'Event not found' });
-
-        const partCheck = await queryOne('SELECT partusn FROM participant WHERE partusn = $1 AND parteid = $2 LIMIT 1', [userUSN, eventId]);
-        if (partCheck) return res.status(403).json({ error: 'You are already registered as a participant for this event. Participants cannot also volunteer.' });
-
-        const maxVoln = event.maxvoln || 0;
-        if (maxVoln > 0) {
-            const count = await queryCount('SELECT count(*) FROM volunteer WHERE volneid = $1', [eventId]);
-            if (count >= maxVoln) return res.status(400).json({ error: 'No more volunteer slots available' });
-        }
-
-        await query('INSERT INTO volunteer (volnusn, volneid, volnstatus) VALUES ($1, $2, false)', [userUSN, eventId]);
+        await seats.joinVolunteer(req.params.eventId, req.session.userUSN);
         res.json({ success: true, message: 'Successfully volunteered for event!' });
-    } catch (err) {
-        res.status(500).json({ error: 'Error volunteering for event' });
-    }
+    } catch (err) { sendSeatError(res, err, 'Error volunteering for event'); }
 });
 
 app.get('/api/events/:eventId/volunteer-count', requireAuth, async (req, res) => {
@@ -1158,7 +1823,7 @@ app.post('/api/request-pin-otp', requireAuth, async (req, res) => {
 
         const sendSmtpEmail = new Brevo.SendSmtpEmail();
         sendSmtpEmail.subject = 'Your Organizer PIN Change OTP - FLO';
-        sendSmtpEmail.sender = { name: 'FLO E-Pass System', email: 'flobms3@gmail.com' };
+        sendSmtpEmail.sender = MAIL_SENDER;
         sendSmtpEmail.to = [{ email: userData.emailid, name: userData.sname }];
         sendSmtpEmail.htmlContent = `
             <html><body style="font-family: Arial, sans-serif; background:#f5f0e8; padding:20px;">
@@ -1224,44 +1889,24 @@ app.post('/api/reset-organizer-pin', requireAuth, async (req, res) => {
 
 // ==================== UPI PAYMENT & TEAMS ====================
 
-app.post('/api/events/:eventId/register-upi', requireAuth, async (req, res) => {
+app.post('/api/events/:eventId/register-upi', requireAuth, seatLimiter, async (req, res) => {
     try {
-        const eventId = req.params.eventId;
-        const userUSN = req.session.userUSN;
-        const { transaction_id } = req.body;
-
-        if (!transaction_id) return res.status(400).json({ error: 'Transaction ID is required' });
-
-        const existing = await queryOne('SELECT partusn FROM participant WHERE partusn = $1 AND parteid = $2 LIMIT 1', [userUSN, eventId]);
-        if (existing) return res.status(400).json({ error: 'You are already registered for this event' });
-
-        const eventData = await queryOne('SELECT regfee, maxpart, orgusn FROM event WHERE eid = $1 LIMIT 1', [eventId]);
-        if (!eventData) return res.status(404).json({ error: 'Event not found' });
-        if (eventData.orgusn === userUSN) return res.status(403).json({ error: 'You cannot register in an event you organize' });
-
-        const amount = eventData.regfee || 0;
-        if (amount <= 0) return res.status(400).json({ error: 'This is not a paid event' });
-
-        if (eventData.maxpart > 0) {
-            const count = await queryCount('SELECT count(*) FROM participant WHERE parteid = $1', [eventId]);
-            if (count >= eventData.maxpart) return res.status(400).json({ error: 'Event is full' });
+        const txn = String(req.body?.transaction_id || '').trim().slice(0, 64);
+        if (!txn) return res.status(400).json({ error: 'Transaction ID is required' });
+        const r = await seats.submitPayment(req.params.eventId, req.session.userUSN, txn);
+        if (r.seatTaken) {
+            return res.status(409).json({
+                code: 'SEAT_TAKEN',
+                error: 'Your 15-minute hold ended and the seat was given to the next person in the queue. Your payment is recorded, so please contact the organiser for a refund.',
+            });
         }
-
-        await query(`
-            UPDATE registration_queue SET status = 'submitted'
-            WHERE event_id = $1 AND usn = $2
-        `, [eventId, userUSN]);
-
-        await query('INSERT INTO payment (usn, event_id, amount, status, upi_transaction_id) VALUES ($1, $2, $3, $4, $5)',
-            [userUSN, eventId, amount, 'pending_verification', transaction_id]);
-
-        await query('INSERT INTO participant (partusn, parteid, partstatus, payment_status) VALUES ($1, $2, false, $3)',
-            [userUSN, eventId, 'pending_verification']);
-
-        res.json({ success: true, message: 'Registration submitted! Your payment is pending verification by the organizer.', userUSN });
-    } catch (err) {
-        res.status(500).json({ error: 'Error submitting registration' });
-    }
+        res.json({
+            success: true, late: !!r.late, userUSN: req.session.userUSN,
+            message: r.late
+                ? 'Payment received after your hold ended. The organiser will review it and confirm if your seat is still free.'
+                : 'Registration submitted! Your payment is pending verification by the organizer.',
+        });
+    } catch (err) { sendSeatError(res, err, 'Error submitting registration'); }
 });
 
 app.post('/api/payments/verify', requireAuth, async (req, res) => {
@@ -1281,7 +1926,8 @@ app.post('/api/payments/verify', requireAuth, async (req, res) => {
                 const teamMembers = await query('SELECT student_usn FROM team_members WHERE team_id = $1 AND join_status = true', [team.id]);
                 const allTeamUSNs = teamMembers.map(m => m.student_usn);
 
-                await query('UPDATE payment SET status = $1 WHERE event_id = $2 AND usn = $3 AND status = $4', ['verified', eventId, participantUSN, 'pending_verification']);
+                const upT = await query("UPDATE payment SET status = 'verified', reviewed_at = now() WHERE event_id = $1 AND usn = $2 AND status = 'pending_verification' RETURNING usn", [eventId, participantUSN]);
+                if (upT.length === 0) return res.status(404).json({ error: 'No pending payment found for this team (it may have been rejected already).' });
 
                 for (const memberUsn of allTeamUSNs) {
                     await query('UPDATE participant SET payment_status = $1 WHERE partusn = $2 AND parteid = $3', ['verified', memberUsn, eventId]);
@@ -1291,7 +1937,8 @@ app.post('/api/payments/verify', requireAuth, async (req, res) => {
             }
         }
 
-        await query('UPDATE payment SET status = $1 WHERE event_id = $2 AND usn = $3 AND status = $4', ['verified', eventId, participantUSN, 'pending_verification']);
+        const upI = await query("UPDATE payment SET status = 'verified', reviewed_at = now() WHERE event_id = $1 AND usn = $2 AND status = 'pending_verification' RETURNING usn", [eventId, participantUSN]);
+        if (upI.length === 0) return res.status(404).json({ error: 'No pending payment found for this student (it may have been rejected already).' });
         await query('UPDATE participant SET payment_status = $1 WHERE partusn = $2 AND parteid = $3', ['verified', participantUSN, eventId]);
 
         res.json({ success: true, message: 'Payment verified successfully!' });
@@ -1308,10 +1955,11 @@ app.get('/api/events/:eventId/pending-payments', requireAuth, async (req, res) =
         if (event.orgusn !== req.session.userUSN) return res.status(403).json({ error: 'Not authorized' });
 
         const pendingPayments = await query(`
-            SELECT p.usn, p.amount, p.upi_transaction_id, p.created_at, p.status,
+            SELECT p.usn, p.amount, p.upi_transaction_id, p.created_at, p.status, p.late,
                    s.sname, s.emailid, s.mobno
             FROM payment p JOIN student s ON p.usn = s.usn
             WHERE p.event_id = $1 AND p.status = 'pending_verification'
+            ORDER BY p.created_at
         `, [eventId]);
 
         let paymentsToShow = [];
@@ -1325,7 +1973,7 @@ app.get('/api/events/:eventId/pending-payments', requireAuth, async (req, res) =
                         studentEmail: payment.emailid || 'N/A', studentMobile: payment.mobno || 'N/A',
                         transactionId: payment.upi_transaction_id || 'N/A', amount: payment.amount || 0,
                         submittedAt: payment.created_at || null, teamName: teamData.team_name,
-                        teamMemberCount: memberCount || 1, isTeamLeader: true
+                        teamMemberCount: memberCount || 1, isTeamLeader: true, late: !!payment.late
                     });
                 }
             }
@@ -1334,13 +1982,56 @@ app.get('/api/events/:eventId/pending-payments', requireAuth, async (req, res) =
                 partusn: payment.usn, studentName: payment.sname || 'Unknown',
                 studentEmail: payment.emailid || 'N/A', studentMobile: payment.mobno || 'N/A',
                 transactionId: payment.upi_transaction_id || 'N/A', amount: payment.amount || 0,
-                submittedAt: payment.created_at || null, teamName: null, isTeamLeader: false
+                submittedAt: payment.created_at || null, teamName: null, isTeamLeader: false, late: !!payment.late
             }));
         }
-        res.json({ success: true, pendingPayments: paymentsToShow, isTeamEvent: event.is_team });
+
+        // paid after the seat had already gone to someone else: organiser needs to refund these
+        const refunds = await query(`
+            SELECT p.usn, p.amount, p.upi_transaction_id, p.created_at, s.sname, s.mobno
+            FROM payment p JOIN student s ON p.usn = s.usn
+            WHERE p.event_id = $1 AND p.status = 'refund_needed' ORDER BY p.created_at
+        `, [eventId]);
+
+        res.json({
+            success: true, pendingPayments: paymentsToShow, isTeamEvent: event.is_team,
+            refundNeeded: refunds.map(r => ({
+                partusn: r.usn, studentName: r.sname || 'Unknown', studentMobile: r.mobno || 'N/A',
+                transactionId: r.upi_transaction_id || 'N/A', amount: r.amount || 0, submittedAt: r.created_at || null
+            }))
+        });
     } catch (err) {
         res.status(500).json({ error: 'Error fetching pending payments' });
     }
+});
+
+app.post('/api/payments/reject', requireAuth, async (req, res) => {
+    try {
+        const { participantUSN, eventId, reason } = req.body || {};
+        if (!participantUSN || !eventId) return res.status(400).json({ error: 'Participant USN and Event ID are required' });
+        await seats.rejectPayment({ eventId, organiserUsn: req.session.userUSN, targetUsn: String(participantUSN), reason });
+        res.json({ success: true, message: 'Payment rejected. The seat has been released.' });
+    } catch (err) { sendSeatError(res, err, 'Error rejecting payment'); }
+});
+
+app.post('/api/payments/refunded', requireAuth, async (req, res) => {
+    try {
+        const { participantUSN, eventId } = req.body || {};
+        const ev = await queryOne('SELECT orgusn FROM event WHERE eid = $1 LIMIT 1', [parseInt(eventId)]);
+        if (!ev) return res.status(404).json({ error: 'Event not found' });
+        if (ev.orgusn !== req.session.userUSN) return res.status(403).json({ error: 'Not authorized' });
+        await query(`UPDATE payment SET status = 'refunded', reviewed_at = now()
+                     WHERE event_id = $1 AND usn = $2 AND status = 'refund_needed'`, [parseInt(eventId), String(participantUSN)]);
+        res.json({ success: true });
+    } catch (err) {
+        res.status(500).json({ error: 'Error updating refund status' });
+    }
+});
+
+// rejected / seat-taken payments the student should still see on the event page
+app.get('/api/my-payment-notices', requireAuth, async (req, res) => {
+    try { res.json({ success: true, notices: await seats.getNotices(req.session.userUSN) }); }
+    catch (err) { console.error('notices:', err); res.status(500).json({ error: 'Error loading notices' }); }
 });
 
 app.post('/api/events/:eventId/create-team', requireAuth, async (req, res) => {
@@ -1440,6 +2131,7 @@ app.get('/api/events/:eventId/team-status', requireAuth, async (req, res) => {
 
 app.post('/api/events/:eventId/register-team', requireAuth, async (req, res) => {
     try {
+      await seats.exclusive(req.params.eventId, async (c) => {
         const eventId = req.params.eventId;
         const userUSN = req.session.userUSN;
 
@@ -1455,9 +2147,8 @@ app.post('/api/events/:eventId/register-team', requireAuth, async (req, res) => 
         const members = await query('SELECT student_usn FROM team_members WHERE team_id = $1 AND join_status = true', [team.id]);
         if (members.length < team.min_team_size) return res.status(400).json({ error: `Minimum ${team.min_team_size} members required.` });
 
-        if (team.maxpart > 0) {
-            const count = await queryCount('SELECT count(*) FROM team WHERE event_id = $1 AND registration_complete = true', [eventId]);
-            if (count >= team.maxpart) return res.status(400).json({ error: `Event is full.` });
+        if (team.maxpart > 0 && (await seats.teamsTaken(c, parseInt(eventId), team.id)) >= team.maxpart) {
+            return res.status(400).json({ error: 'Event is full.' });
         }
         if (team.regfee > 0) return res.json({ success: true, requiresPayment: true, message: 'Payment required', teamId: team.id, regFee: team.regfee });
 
@@ -1471,13 +2162,15 @@ app.post('/api/events/:eventId/register-team', requireAuth, async (req, res) => 
             `, [m.student_usn, eventId, team.id]);
         }
         res.json({ success: true, message: 'Team registered successfully!', teamId: team.id, userUSN });
+      });
     } catch (err) {
-        res.status(500).json({ error: 'Error registering team' });
+        sendSeatError(res, err, 'Error registering team');
     }
 });
 
 app.post('/api/events/:eventId/register-team-upi', requireAuth, async (req, res) => {
     try {
+      await seats.exclusive(req.params.eventId, async (c) => {
         const eventId = req.params.eventId;
         const userUSN = req.session.userUSN;
         const { transaction_id } = req.body;
@@ -1492,6 +2185,11 @@ app.post('/api/events/:eventId/register-team-upi', requireAuth, async (req, res)
         if (!team) return res.status(404).json({ error: 'Team not found or you are not the team leader' });
         if (team.registration_complete) return res.status(400).json({ error: 'Team is already registered' });
         if (team.regfee <= 0) return res.status(400).json({ error: 'This is not a paid event' });
+        if (team.maxpart > 0 && (await seats.teamsTaken(c, parseInt(eventId), team.id)) >= team.maxpart) {
+            return res.status(400).json({ error: 'Event is full.' });
+        }
+        const dupPay = await queryOne("SELECT 1 FROM payment WHERE usn = $1 AND event_id = $2 AND status = 'pending_verification' LIMIT 1", [userUSN, eventId]);
+        if (dupPay) return res.status(409).json({ error: 'Your payment is already submitted and pending verification.' });
 
         const members = await query('SELECT student_usn FROM team_members WHERE team_id = $1 AND join_status = true', [team.id]);
         if (members.length < team.min_team_size) return res.status(400).json({ error: `Minimum ${team.min_team_size} members required.` });
@@ -1507,8 +2205,9 @@ app.post('/api/events/:eventId/register-team-upi', requireAuth, async (req, res)
             `, [m.student_usn, eventId, team.id]);
         }
         res.json({ success: true, message: 'Team registration submitted! Pending verification.', userUSN });
+      });
     } catch (err) {
-        res.status(500).json({ error: 'Error registering team' });
+        sendSeatError(res, err, 'Error registering team');
     }
 });
 
@@ -1928,75 +2627,109 @@ app.get('/api/admin/organizer-requests', requireAdmin, async (req, res) => {
 
 // ─── Admin: Approve organizer request ──────────────────────────────────────────
 app.post('/api/admin/organizer-requests/:id/approve', requireAdmin, async (req, res) => {
+    const id = parseInt(req.params.id);
+    if (!id) return res.status(400).json({ error: 'Invalid request id' });
+    const client = await pool.connect();
     try {
-        const { id } = req.params;
-        const request = await queryOne(
-            'SELECT * FROM organizer_request WHERE id = $1 LIMIT 1',
-            [id]
-        );
-        if (!request) return res.status(404).json({ error: 'Request not found' });
-        if (request.status !== 'pending') return res.status(400).json({ error: 'Request already reviewed' });
+        await client.query('BEGIN');
+        const r = (await client.query('SELECT * FROM organizer_request WHERE id = $1 FOR UPDATE', [id])).rows[0];
+        if (!r) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'Request not found' }); }
+        if (r.status !== 'pending') { await client.query('ROLLBACK'); return res.status(400).json({ error: 'Request already reviewed' }); }
 
-        // Check if club exists, create if not
-        let club = await queryOne(
-            'SELECT cid FROM club WHERE LOWER(cname) = LOWER($1) LIMIT 1',
-            [request.club_name]
-        );
+        const clubName = String(r.club_name || '').trim();
+        if (!clubName || clubName.length > 50) {
+            await client.query('ROLLBACK');
+            return res.status(400).json({ error: 'The club name is empty or longer than 50 characters. Reject this request and ask the student to resubmit with a shorter name.' });
+        }
+
+        // one approval per club name at a time, so the same club can never be created twice
+        await client.query('SELECT pg_advisory_xact_lock(hashtext($1))', ['club:' + clubName.toLowerCase()]);
+
+        let club = (await client.query('SELECT cid, cname, maxmembers FROM club WHERE LOWER(cname) = LOWER($1) LIMIT 1', [clubName])).rows[0];
+        let clubCreated = false;
         if (!club) {
-            club = await queryOne(
-                'INSERT INTO club (cname, clubdesc, maxmembers) VALUES ($1, $2, 100) RETURNING cid',
-                [request.club_name, `${request.club_name} at ${request.college_name}`]
-            );
+            club = (await client.query(
+                'INSERT INTO club (cname, clubdesc, maxmembers) VALUES ($1, $2, 100) RETURNING cid, cname, maxmembers',
+                [clubName, `${clubName} at ${String(r.college_name || '').slice(0, 200)}`]
+            )).rows[0];
+            clubCreated = true;
         }
 
-        // Add student as club member if not already
-        const alreadyMember = await queryOne(
-            'SELECT clubid FROM memberof WHERE studentusn = $1 AND clubid = $2 LIMIT 1',
-            [request.usn, club.cid]
-        );
-        if (!alreadyMember) {
-            await query(
-                'INSERT INTO memberof (studentusn, clubid) VALUES ($1, $2)',
-                [request.usn, club.cid]
-            );
+        const already = (await client.query('SELECT 1 FROM memberof WHERE studentusn = $1 AND clubid = $2', [r.usn, club.cid])).rowCount > 0;
+        const count = (await client.query('SELECT count(*)::int AS n FROM memberof WHERE clubid = $1', [club.cid])).rows[0].n;
+        if (!already && count >= (club.maxmembers || 100)) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({
+                code: 'CLUB_FULL',
+                error: `"${club.cname}" is full (${count}/${club.maxmembers}). Raise its limit in the Clubs tab first, then approve again.`,
+            });
+        }
+        if (already) {
+            await client.query('UPDATE memberof SET role_in_club = $3 WHERE studentusn = $1 AND clubid = $2', [r.usn, club.cid, r.role_in_club]);
+        } else {
+            await client.query('INSERT INTO memberof (studentusn, clubid, role_in_club) VALUES ($1, $2, $3)', [r.usn, club.cid, r.role_in_club]);
         }
 
-        // Mark request approved
-        await query(`
-            UPDATE organizer_request
-            SET status = 'approved', reviewed_at = NOW(), reviewed_by = $1
-            WHERE id = $2
-        `, [req.session.userUSN, id]);
+        await client.query(`UPDATE organizer_request
+            SET status = 'approved', reviewed_at = NOW(), reviewed_by = $1, reject_reason = NULL
+            WHERE id = $2`, [req.session.userUSN, id]);
+        await client.query('COMMIT');
 
-        res.json({ success: true, message: `Organizer approved and added to club "${request.club_name}"` });
+        // best-effort email; never blocks the approval
+        queryOne('SELECT sname, emailid FROM student WHERE usn = $1', [r.usn]).then((s) => {
+            if (!s || !s.emailid) return;
+            return sendMailSafe({ to: s.emailid, name: s.sname, subject: `You are now an organiser for ${club.cname}`,
+                html: mailShell(`<p>Hello <strong>${escapeHtml(s.sname)}</strong>,</p>
+                  <p>Your request was approved. You can now create events for <strong>${escapeHtml(club.cname)}</strong> on FLO.</p>
+                  <a href="${FRONTEND_URL_BASE}" style="display:inline-block;background:#0D0D0D;color:#FFD600;font-family:monospace;font-weight:700;padding:12px 20px;text-decoration:none;">OPEN FLO</a>`) });
+        }).catch((e) => console.error('approve mail:', e.message));
+
+        res.json({
+            success: true, clubCreated, clubName: club.cname, members: count + (already ? 0 : 1), maxMembers: club.maxmembers,
+            message: `Approved. ${clubCreated ? 'New club created: ' : 'Added to club: '}"${club.cname}"`,
+        });
     } catch (err) {
+        try { await client.query('ROLLBACK'); } catch (_) { /* ignore */ }
         console.error('Approve error:', err);
-        res.status(500).json({ error: 'Error approving request: ' + err.message });
+        res.status(500).json({ error: 'Error approving request' });
+    } finally {
+        client.release();
     }
 });
+
 
 // ─── Admin: Reject organizer request ───────────────────────────────────────────
 app.post('/api/admin/organizer-requests/:id/reject', requireAdmin, async (req, res) => {
     try {
-        const { id } = req.params;
-        const request = await queryOne(
-            'SELECT * FROM organizer_request WHERE id = $1 LIMIT 1',
-            [id]
-        );
-        if (!request) return res.status(404).json({ error: 'Request not found' });
-        if (request.status !== 'pending') return res.status(400).json({ error: 'Request already reviewed' });
+        const id = parseInt(req.params.id);
+        if (!id) return res.status(400).json({ error: 'Invalid request id' });
+        const reason = String(req.body?.reason || '').trim().slice(0, 300) || null;
 
-        await query(`
-            UPDATE organizer_request
-            SET status = 'rejected', reviewed_at = NOW(), reviewed_by = $1
-            WHERE id = $2
-        `, [req.session.userUSN, id]);
+        // only a pending request can be rejected, and only once
+        const rows = await query(`UPDATE organizer_request
+            SET status = 'rejected', reviewed_at = NOW(), reviewed_by = $1, reject_reason = $2
+            WHERE id = $3 AND status = 'pending' RETURNING usn, club_name`, [req.session.userUSN, reason, id]);
+        if (rows.length === 0) {
+            const exists = await queryOne('SELECT status FROM organizer_request WHERE id = $1', [id]);
+            return res.status(exists ? 400 : 404).json({ error: exists ? 'Request already reviewed' : 'Request not found' });
+        }
+
+        queryOne('SELECT sname, emailid FROM student WHERE usn = $1', [rows[0].usn]).then((s) => {
+            if (!s || !s.emailid) return;
+            return sendMailSafe({ to: s.emailid, name: s.sname, subject: 'Your organiser request was not approved',
+                html: mailShell(`<p>Hello <strong>${escapeHtml(s.sname)}</strong>,</p>
+                  <p>Your request to become an organiser for <strong>${escapeHtml(rows[0].club_name)}</strong> was not approved.</p>
+                  ${reason ? `<p><strong>Reason:</strong> ${escapeHtml(reason)}</p>` : ''}
+                  <p>You can fix the details and submit the request again from FLO.</p>`) });
+        }).catch((e) => console.error('reject mail:', e.message));
 
         res.json({ success: true, message: 'Request rejected' });
     } catch (err) {
+        console.error('Reject error:', err);
         res.status(500).json({ error: 'Error rejecting request' });
     }
 });
+
 
 // ─── Admin: Get all users ───────────────────────────────────────────────────────
 app.get('/api/admin/users', requireAdmin, async (req, res) => {
@@ -2059,66 +2792,245 @@ app.delete('/api/admin/events/:eventId', requireAdmin, async (req, res) => {
 app.get('/api/admin/organizers', requireAdmin, async (req, res) => {
     try {
         const organizers = await query(`
-            SELECT r.usn, r.college_name, r.club_name, r.role_in_club,
-                   r.college_email, r.approved_at,
+            SELECT r.usn, r.college_name, r.club_name, r.role_in_club, r.college_email,
+                   r.reviewed_at AS approved_at,
                    s.sname, s.emailid, s.sem,
-                   COUNT(DISTINCT e.eid) AS events_organized
+                   (SELECT count(*) FROM event e WHERE e.orgusn = r.usn)::int AS events_organized,
+                   COALESCE((SELECT json_agg(json_build_object('cid', c.cid, 'club', c.cname, 'role', m.role_in_club) ORDER BY c.cname)
+                             FROM memberof m JOIN club c ON c.cid = m.clubid WHERE m.studentusn = r.usn), '[]'::json) AS clubs
             FROM organizer_request r
             JOIN student s ON r.usn = s.usn
-            LEFT JOIN event e ON e.orgusn = r.usn
             WHERE r.status = 'approved'
-            GROUP BY r.usn, r.college_name, r.club_name, r.role_in_club,
-                     r.college_email, r.approved_at, s.sname, s.emailid, s.sem
             ORDER BY s.sname ASC
         `);
         res.json({ organizers });
     } catch (err) {
+        console.error('Admin organizers error:', err);
         res.status(500).json({ error: 'Error fetching organizers' });
     }
 });
 
+
 // ─── Admin: Revoke organizer (remove from club membership) ────────────────────
 app.post('/api/admin/organizers/:usn/revoke', requireAdmin, async (req, res) => {
+    const client = await pool.connect();
     try {
-        const { usn } = req.params;
-        // Mark request as rejected so they can't create events
-        await query(
-            "UPDATE organizer_request SET status = 'rejected' WHERE usn = $1",
-            [usn]
-        );
-        // Remove all club memberships
-        await query('DELETE FROM memberof WHERE studentusn = $1', [usn]);
+        const usn = String(req.params.usn || '').trim();
+        await client.query('BEGIN');
+        await client.query(`UPDATE organizer_request
+            SET status = 'rejected', reviewed_at = NOW(), reviewed_by = $2, reject_reason = 'Organiser access was removed by an admin'
+            WHERE usn = $1 AND status = 'approved'`, [usn, req.session.userUSN]);
+        await client.query('DELETE FROM memberof WHERE studentusn = $1', [usn]);
+        await client.query('COMMIT');
         res.json({ success: true, message: 'Organizer status revoked' });
     } catch (err) {
+        try { await client.query('ROLLBACK'); } catch (_) { /* ignore */ }
+        console.error('Revoke error:', err);
         res.status(500).json({ error: 'Error revoking organizer' });
+    } finally { client.release(); }
+});
+
+// ----- Admin: clubs, the organisers in each club, club limit and roles -----
+app.get('/api/admin/clubs', requireAdmin, async (req, res) => {
+    try {
+        const clubs = await query(`
+            SELECT c.cid, c.cname, c.clubdesc, c.maxmembers, c.clubprezusn, ps.sname AS president_name,
+                   count(s.usn)::int AS member_count,
+                   COALESCE(json_agg(json_build_object('usn', s.usn, 'name', s.sname, 'email', s.emailid,
+                            'role', m.role_in_club, 'since', m.added_at) ORDER BY s.sname) FILTER (WHERE s.usn IS NOT NULL), '[]'::json) AS members
+            FROM club c
+            LEFT JOIN memberof m ON m.clubid = c.cid
+            LEFT JOIN student s ON s.usn = m.studentusn
+            LEFT JOIN student ps ON ps.usn = c.clubprezusn
+            GROUP BY c.cid, ps.sname
+            ORDER BY c.cname
+        `);
+        res.json({ clubs });
+    } catch (err) {
+        console.error('Admin clubs error:', err);
+        res.status(500).json({ error: 'Error fetching clubs' });
     }
 });
+
+app.put('/api/admin/clubs/:cid/name', requireAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const cid = parseInt(req.params.cid);
+        const name = String(req.body?.name || '').trim();
+        if (!cid) return res.status(400).json({ error: 'Invalid club' });
+
+        await client.query('BEGIN');
+        const current = (await client.query('SELECT cname FROM club WHERE cid = $1 FOR UPDATE', [cid])).rows[0];
+        if (!current) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Club not found' });
+        }
+        const duplicate = (await client.query(
+            'SELECT 1 FROM club WHERE LOWER(cname) = LOWER($1) AND cid <> $2 LIMIT 1',
+            [name, cid]
+        )).rowCount > 0;
+        if (duplicate) {
+            await client.query('ROLLBACK');
+            return res.status(409).json({ error: 'A club with that name already exists' });
+        }
+
+        await client.query('UPDATE club SET cname = $1 WHERE cid = $2', [name, cid]);
+        await client.query(
+            'UPDATE organizer_request SET club_name = $1 WHERE LOWER(club_name) = LOWER($2)',
+            [name, current.cname]
+        );
+        await client.query('COMMIT');
+        res.json({ success: true, name });
+    } catch (err) {
+        try { await client.query('ROLLBACK'); } catch (_) { /* ignore */ }
+        console.error('club name error:', err);
+        res.status(500).json({ error: 'Error renaming club' });
+    } finally {
+        client.release();
+    }
+});
+
+app.delete('/api/admin/clubs/:cid', requireAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const cid = parseInt(req.params.cid);
+        if (!cid) return res.status(400).json({ error: 'Invalid club' });
+
+        await client.query('BEGIN');
+        const club = (await client.query('SELECT cname FROM club WHERE cid = $1 FOR UPDATE', [cid])).rows[0];
+        if (!club) {
+            await client.query('ROLLBACK');
+            return res.status(404).json({ error: 'Club not found' });
+        }
+
+        // Keep events available, but remove their deleted club reference.
+        await client.query('UPDATE event SET orgcid = NULL WHERE orgcid = $1', [cid]);
+        await client.query('DELETE FROM memberof WHERE clubid = $1', [cid]);
+        await client.query(`UPDATE organizer_request
+            SET status = 'rejected', reviewed_at = NOW(), reviewed_by = $1,
+                reject_reason = 'The club was deleted by an admin'
+            WHERE LOWER(club_name) = LOWER($2) AND status = 'approved'`,
+            [req.session.userUSN, club.cname]);
+        await client.query('UPDATE club SET clubprezusn = NULL WHERE cid = $1', [cid]);
+        await client.query('DELETE FROM club WHERE cid = $1', [cid]);
+        await client.query('COMMIT');
+        res.json({ success: true, message: 'Club deleted' });
+    } catch (err) {
+        try { await client.query('ROLLBACK'); } catch (_) { /* ignore */ }
+        console.error('club delete error:', err);
+        res.status(500).json({ error: 'Error deleting club' });
+    } finally {
+        client.release();
+    }
+});
+
+app.put('/api/admin/clubs/:cid/max-members', requireAdmin, async (req, res) => {
+    try {
+        const cid = parseInt(req.params.cid);
+        const max = parseInt(req.body?.maxMembers);
+        if (!cid || !Number.isInteger(max) || max < 1 || max > 1000) return res.status(400).json({ error: 'Enter a number between 1 and 1000' });
+        const club = await queryOne('SELECT cid FROM club WHERE cid = $1', [cid]);
+        if (!club) return res.status(404).json({ error: 'Club not found' });
+        const n = await queryCount('SELECT count(*) FROM memberof WHERE clubid = $1', [cid]);
+        if (max < n) return res.status(400).json({ error: `This club already has ${n} organisers, so the limit cannot be lower than ${n}.` });
+        await query('UPDATE club SET maxmembers = $1 WHERE cid = $2', [max, cid]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('max-members error:', err);
+        res.status(500).json({ error: 'Error updating club limit' });
+    }
+});
+
+app.put('/api/admin/clubs/:cid/president', requireAdmin, async (req, res) => {
+    try {
+        const cid = parseInt(req.params.cid);
+        const usn = String(req.body?.usn || '').trim().toUpperCase().slice(0, 10);
+        if (!cid) return res.status(400).json({ error: 'Invalid club' });
+        if (usn) {
+            const s = await queryOne('SELECT usn FROM student WHERE usn = $1', [usn]);
+            if (!s) return res.status(404).json({ error: 'No student with that USN' });
+        }
+        const r = await query('UPDATE club SET clubprezusn = $1 WHERE cid = $2 RETURNING cid', [usn || null, cid]);
+        if (r.length === 0) return res.status(404).json({ error: 'Club not found' });
+        res.json({ success: true });
+    } catch (err) {
+        console.error('president error:', err);
+        res.status(500).json({ error: 'Error updating president' });
+    }
+});
+
+app.put('/api/admin/clubs/:cid/members/:usn/role', requireAdmin, async (req, res) => {
+    try {
+        const cid = parseInt(req.params.cid);
+        const usn = String(req.params.usn || '').trim();
+        const role = String(req.body?.role || '').trim().slice(0, 100);
+        if (!cid || !role) return res.status(400).json({ error: 'Role cannot be empty' });
+        const r = await query('UPDATE memberof SET role_in_club = $1 WHERE clubid = $2 AND studentusn = $3 RETURNING studentusn', [role, cid, usn]);
+        if (r.length === 0) return res.status(404).json({ error: 'This student is not an organiser of that club' });
+        await query(`UPDATE organizer_request SET role_in_club = $1
+                     WHERE usn = $2 AND status = 'approved' AND LOWER(club_name) = (SELECT LOWER(cname) FROM club WHERE cid = $3)`, [role, usn, cid]);
+        res.json({ success: true });
+    } catch (err) {
+        console.error('member role error:', err);
+        res.status(500).json({ error: 'Error updating role' });
+    }
+});
+
+// remove one organiser from one club. If it was their last club they stop being an organiser.
+app.delete('/api/admin/clubs/:cid/members/:usn', requireAdmin, async (req, res) => {
+    const client = await pool.connect();
+    try {
+        const cid = parseInt(req.params.cid);
+        const usn = String(req.params.usn || '').trim();
+        if (!cid) { return res.status(400).json({ error: 'Invalid club' }); }
+        await client.query('BEGIN');
+        const del = await client.query('DELETE FROM memberof WHERE clubid = $1 AND studentusn = $2', [cid, usn]);
+        if (del.rowCount === 0) { await client.query('ROLLBACK'); return res.status(404).json({ error: 'This student is not an organiser of that club' }); }
+        const left = (await client.query('SELECT count(*)::int AS n FROM memberof WHERE studentusn = $1', [usn])).rows[0].n;
+        let accessRemoved = false;
+        if (left === 0) {
+            await client.query(`UPDATE organizer_request
+                SET status = 'rejected', reviewed_at = NOW(), reviewed_by = $2, reject_reason = 'Removed from the club by an admin'
+                WHERE usn = $1 AND status = 'approved'`, [usn, req.session.userUSN]);
+            accessRemoved = true;
+        }
+        await client.query('COMMIT');
+        res.json({ success: true, organiserAccessRemoved: accessRemoved });
+    } catch (err) {
+        try { await client.query('ROLLBACK'); } catch (_) { /* ignore */ }
+        console.error('remove member error:', err);
+        res.status(500).json({ error: 'Error removing organiser' });
+    } finally { client.release(); }
+});
+
 
 // ─── Student: Submit organizer request ─────────────────────────────────────────
 app.post('/api/organizer-request', requireAuth, async (req, res) => {
     try {
-        const { college_email, college_name, club_name, role_in_club } = req.body;
+        const college_email = String(req.body?.college_email || '').trim().slice(0, 255);
+        const college_name  = String(req.body?.college_name  || '').trim().slice(0, 255);
+        const club_name     = String(req.body?.club_name     || '').trim();
+        const role_in_club  = String(req.body?.role_in_club  || '').trim();
         if (!college_email || !college_name || !club_name || !role_in_club) {
             return res.status(400).json({ error: 'All fields are required' });
         }
+        if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(college_email)) return res.status(400).json({ error: 'Enter a valid college email address' });
+        if (club_name.length > 50) return res.status(400).json({ error: 'Club name must be 50 characters or fewer' });
+        if (role_in_club.length > 100) return res.status(400).json({ error: 'Role must be 100 characters or fewer' });
 
         const existing = await queryOne(
             'SELECT id, status FROM organizer_request WHERE usn = $1 LIMIT 1',
             [req.session.userUSN]
         );
         if (existing) {
-            if (existing.status === 'pending') {
-                return res.status(400).json({ error: 'You already have a pending request' });
-            }
-            if (existing.status === 'approved') {
-                return res.status(400).json({ error: 'You are already an approved organizer' });
-            }
-            // Rejected — allow resubmission by updating
+            if (existing.status === 'pending') return res.status(400).json({ error: 'You already have a pending request' });
+            if (existing.status === 'approved') return res.status(400).json({ error: 'You are already an approved organizer' });
+            // Rejected: allow resubmission by updating
             await query(`
                 UPDATE organizer_request
                 SET college_email = $1, college_name = $2, club_name = $3,
                     role_in_club = $4, status = 'pending', created_at = NOW(),
-                    reviewed_at = NULL, reviewed_by = NULL
+                    reviewed_at = NULL, reviewed_by = NULL, reject_reason = NULL
                 WHERE usn = $5
             `, [college_email, college_name, club_name, role_in_club, req.session.userUSN]);
             return res.json({ success: true, message: 'Request resubmitted successfully' });
@@ -2131,15 +3043,17 @@ app.post('/api/organizer-request', requireAuth, async (req, res) => {
 
         res.status(201).json({ success: true, message: 'Request submitted! We will review it shortly.' });
     } catch (err) {
-        res.status(500).json({ error: 'Error submitting request: ' + err.message });
+        console.error('organizer-request error:', err);
+        res.status(500).json({ error: 'Error submitting request' });
     }
 });
+
 
 // ─── Student: Check own organizer request status ───────────────────────────────
 app.get('/api/organizer-request/status', requireAuth, async (req, res) => {
     try {
         const request = await queryOne(
-            'SELECT id, status, created_at, college_name, club_name, role_in_club FROM organizer_request WHERE usn = $1 LIMIT 1',
+            'SELECT id, status, created_at, college_name, club_name, role_in_club, reject_reason FROM organizer_request WHERE usn = $1 LIMIT 1',
             [req.session.userUSN]
         );
         res.json({ request: request || null });
@@ -2151,264 +3065,46 @@ app.get('/api/organizer-request/status', requireAuth, async (req, res) => {
 
 
 // ============================================================
-// QUEUE SYSTEM ROUTES
-// Add these inside new_routes.js (before app.listen)
+// SEAT / QUEUE ROUTES  (logic lives in the seat engine above)
 // ============================================================
 
-// ── Helper: clean up expired queue entries ─────────────────────
-async function purgeExpiredQueue(eventId) {
-    await query(`
-        UPDATE registration_queue
-        SET status = 'expired'
-        WHERE event_id = $1
-          AND status = 'holding'
-          AND expires_at < NOW()
-    `, [eventId]);
-}
-
-// ── Helper: count truly occupied seats ─────────────────────────
-// Occupied = confirmed participants + active holding slots
-async function occupiedSeats(eventId) {
-    // Confirmed registrations (free or payment verified)
-    const confirmed = await queryCount(`
-        SELECT count(*) FROM participant
-        WHERE parteid = $1
-          AND payment_status IN ('free', 'verified', 'pending_verification')
-    `, [eventId]);
-
-    // Active holding slots (someone clicked Register but hasn't submitted TXN ID yet)
-    const holding = await queryCount(`
-        SELECT count(*) FROM registration_queue
-        WHERE event_id = $1
-          AND status = 'holding'
-          AND expires_at > NOW()
-    `, [eventId]);
-
-    return confirmed + holding;
-}
-
-// ── GET /api/events/:eventId/seat-status ───────────────────────
-// Frontend calls this to know: available / holding / queued / full
+// read-only; the page polls this, so it does no writes
 app.get('/api/events/:eventId/seat-status', requireAuth, async (req, res) => {
-    try {
-        const eventId = parseInt(req.params.eventId);
-        const userUSN  = req.session.userUSN;
-
-        await purgeExpiredQueue(eventId);
-
-        const event = await queryOne(
-            'SELECT maxpart, regfee, is_team FROM event WHERE eid = $1 LIMIT 1',
-            [eventId]
-        );
-        if (!event) return res.status(404).json({ error: 'Event not found' });
-
-        const maxPart = event.maxpart || 0;
-
-        // Already registered?
-        const alreadyIn = await queryOne(
-            'SELECT payment_status FROM participant WHERE partusn = $1 AND parteid = $2 LIMIT 1',
-            [userUSN, eventId]
-        );
-        if (alreadyIn) return res.json({ status: 'registered', paymentStatus: alreadyIn.payment_status });
-
-        // Already in queue?
-        const mySlot = await queryOne(
-            'SELECT id, status, expires_at FROM registration_queue WHERE event_id = $1 AND usn = $2 LIMIT 1',
-            [eventId, userUSN]
-        );
-        if (mySlot && mySlot.status === 'holding') {
-            const secsLeft = Math.max(0, Math.ceil((new Date(mySlot.expires_at) - Date.now()) / 1000));
-            return res.json({ status: 'holding', expiresIn: secsLeft, queueId: mySlot.id });
-        }
-
-        if (maxPart === 0) return res.json({ status: 'available' });
-
-        const occupied = await occupiedSeats(eventId);
-        if (occupied < maxPart) return res.json({ status: 'available', remaining: maxPart - occupied });
-
-        // Check queue position
-        const queuePos = await queryCount(`
-            SELECT count(*) FROM registration_queue
-            WHERE event_id = $1
-              AND status = 'holding'
-              AND expires_at > NOW()
-              AND created_at < COALESCE(
-                (SELECT created_at FROM registration_queue WHERE event_id = $1 AND usn = $2 LIMIT 1),
-                NOW() + INTERVAL '1 year'
-              )
-        `, [eventId, userUSN]);
-
-        return res.json({
-            status: 'full',
-            queueLength: await queryCount(`
-                SELECT count(*) FROM registration_queue
-                WHERE event_id = $1 AND status = 'holding' AND expires_at > NOW()
-            `, [eventId]),
-        });
-    } catch (err) {
-        console.error('seat-status error:', err);
-        res.status(500).json({ error: 'Error checking seat status' });
-    }
+    try { res.json({ success: true, ...(await seats.getStatus(req.params.eventId, req.session.userUSN)) }); }
+    catch (err) { sendSeatError(res, err, 'Error checking seat status'); }
 });
 
-// ── POST /api/events/:eventId/claim-seat ───────────────────────
-// Called when user clicks "Register" on a paid event.
-// Reserves their slot for HOLD_MINUTES before they submit TXN ID.
-const HOLD_MINUTES = 15;
-
-app.post('/api/events/:eventId/claim-seat', requireAuth, async (req, res) => {
+app.post('/api/events/:eventId/claim-seat', requireAuth, seatLimiter, async (req, res) => {
     try {
-        const eventId = parseInt(req.params.eventId);
-        const userUSN  = req.session.userUSN;
-
-        await purgeExpiredQueue(eventId);
-
-        const event = await queryOne(
-            'SELECT maxpart, regfee, orgusn, is_team FROM event WHERE eid = $1 LIMIT 1',
-            [eventId]
-        );
-        if (!event) return res.status(404).json({ error: 'Event not found' });
-        if (event.orgusn === userUSN) return res.status(403).json({ error: 'You cannot register in your own event' });
-        if ((event.regfee || 0) <= 0) return res.status(400).json({ error: 'Use the free registration flow for free events' });
-
-        // Already registered?
-        const alreadyIn = await queryOne(
-            'SELECT partusn FROM participant WHERE partusn = $1 AND parteid = $2 LIMIT 1',
-            [userUSN, eventId]
-        );
-        if (alreadyIn) return res.status(400).json({ error: 'You are already registered' });
-
-        // Already holding?
-        const existing = await queryOne(
-            'SELECT id, status, expires_at FROM registration_queue WHERE event_id = $1 AND usn = $2 LIMIT 1',
-            [eventId, userUSN]
-        );
-        if (existing && existing.status === 'holding' && new Date(existing.expires_at) > new Date()) {
-            const secsLeft = Math.ceil((new Date(existing.expires_at) - Date.now()) / 1000);
-            return res.json({ success: true, status: 'holding', expiresIn: secsLeft, queueId: existing.id, message: 'You already have an active seat hold' });
-        }
-
-        const maxPart = event.maxpart || 0;
-        if (maxPart > 0) {
-            const occupied = await occupiedSeats(eventId);
-            if (occupied >= maxPart) {
-                // Event full — put in queue
-                const expiresAt = new Date(Date.now() + HOLD_MINUTES * 60 * 1000);
-                const slot = await queryOne(`
-                    INSERT INTO registration_queue (event_id, usn, status, expires_at)
-                    VALUES ($1, $2, 'holding', $3)
-                    ON CONFLICT (event_id, usn) DO UPDATE
-                        SET status = 'holding', expires_at = $3, created_at = NOW()
-                    RETURNING id
-                `, [eventId, userUSN, expiresAt]);
-
-                const pos = await queryCount(`
-                    SELECT count(*) FROM registration_queue
-                    WHERE event_id = $1
-                      AND status = 'holding'
-                      AND expires_at > NOW()
-                      AND created_at <= (SELECT created_at FROM registration_queue WHERE id = $2 LIMIT 1)
-                `, [eventId, slot.id]);
-
-                return res.json({
-                    success: true,
-                    status: 'queued',
-                    queuePosition: pos,
-                    expiresIn: HOLD_MINUTES * 60,
-                    message: `Event is full. You are #${pos} in the queue. If a seat opens you will be notified here.`
-                });
-            }
-        }
-
-        // Seat available — create hold
-        const expiresAt = new Date(Date.now() + HOLD_MINUTES * 60 * 1000);
-        const slot = await queryOne(`
-            INSERT INTO registration_queue (event_id, usn, status, expires_at)
-            VALUES ($1, $2, 'holding', $3)
-            ON CONFLICT (event_id, usn) DO UPDATE
-                SET status = 'holding', expires_at = $3, created_at = NOW()
-            RETURNING id
-        `, [eventId, userUSN, expiresAt]);
-
-        res.json({
-            success: true,
-            status: 'holding',
-            queueId: slot.id,
-            expiresIn: HOLD_MINUTES * 60,
-            message: `Seat held for ${HOLD_MINUTES} minutes. Please complete payment before time runs out.`
-        });
-    } catch (err) {
-        console.error('claim-seat error:', err);
-        res.status(500).json({ error: 'Error claiming seat: ' + err.message });
-    }
+        const r = await seats.claimSeat(req.params.eventId, req.session.userUSN);
+        res.json({ ...r, message: r.status === 'holding'
+            ? `Seat held for ${seats.HOLD_MINUTES} minutes. Please complete payment before time runs out.`
+            : `Event is full. You are #${r.queuePosition} in the queue.` });
+    } catch (err) { sendSeatError(res, err, 'Error claiming seat'); }
 });
 
-// ── GET /api/events/:eventId/queue-position ────────────────────
-// Polling endpoint — frontend calls every 30s to check if
-// a queued person has been promoted to a real hold.
+// the queue screen polls this; promoted = a seat has been offered to you
 app.get('/api/events/:eventId/queue-position', requireAuth, async (req, res) => {
     try {
-        const eventId = parseInt(req.params.eventId);
-        const userUSN  = req.session.userUSN;
+        const st = await seats.getStatus(req.params.eventId, req.session.userUSN);
+        res.json({ success: true, ...st, promoted: st.status === 'holding' });
+    } catch (err) { sendSeatError(res, err, 'Error checking queue position'); }
+});
 
-        await purgeExpiredQueue(eventId);
+app.delete('/api/events/:eventId/release-queue', requireAuth, async (req, res) => {
+    try { res.json(await seats.releaseQueue(req.params.eventId, req.session.userUSN)); }
+    catch (err) { sendSeatError(res, err, 'Error leaving the queue'); }
+});
 
-        const mySlot = await queryOne(
-            'SELECT id, status, expires_at FROM registration_queue WHERE event_id = $1 AND usn = $2 LIMIT 1',
-            [eventId, userUSN]
-        );
-
-        if (!mySlot || mySlot.status === 'expired') {
-            return res.json({ status: 'expired' });
-        }
-
-        if (mySlot.status === 'submitted') {
-            return res.json({ status: 'submitted' });
-        }
-
-        // Check if a seat has opened for this person (they're first in queue)
-        const event = await queryOne('SELECT maxpart FROM event WHERE eid = $1 LIMIT 1', [eventId]);
-        const maxPart = event?.maxpart || 0;
-
-        if (maxPart > 0) {
-            const occupied = await occupiedSeats(eventId);
-            if (occupied < maxPart) {
-                // Seat opened — they're promoted, update their expiry to give them 15 min from now
-                const newExpiry = new Date(Date.now() + HOLD_MINUTES * 60 * 1000);
-                await query(`
-                    UPDATE registration_queue SET expires_at = $1 WHERE id = $2
-                `, [newExpiry, mySlot.id]);
-                return res.json({
-                    status: 'holding',
-                    expiresIn: HOLD_MINUTES * 60,
-                    promoted: true,
-                    message: 'A seat just opened! You have 15 minutes to complete payment.'
-                });
-            }
-        }
-
-        // Still queued
-        const secsLeft = Math.max(0, Math.ceil((new Date(mySlot.expires_at) - Date.now()) / 1000));
-        const pos = await queryCount(`
-            SELECT count(*) FROM registration_queue
-            WHERE event_id = $1
-              AND status = 'holding'
-              AND expires_at > NOW()
-              AND created_at <= (SELECT created_at FROM registration_queue WHERE id = $2 LIMIT 1)
-        `, [eventId, mySlot.id]);
-
-        res.json({
-            status: secsLeft > 0 ? 'queued' : 'expired',
-            queuePosition: pos,
-            expiresIn: secsLeft
-        });
-    } catch (err) {
-        res.status(500).json({ error: 'Error checking queue position' });
-    }
+app.delete('/api/events/:eventId/release-holding', requireAuth, async (req, res) => {
+    try { res.json(await seats.releaseHolding(req.params.eventId, req.session.userUSN)); }
+    catch (err) { sendSeatError(res, err, 'Error releasing seat'); }
 });
 
 
 app.listen(PORT, '0.0.0.0', () => {
+    seats.startSweeper(20000);
+    const mailTimer = setInterval(flushMailRetry, 5 * 60 * 1000); if (mailTimer.unref) mailTimer.unref();
     console.log('\n' + '─'.repeat(50));
     console.log(`🚀 FLO BACKEND: http://localhost:${PORT}`);
     console.log(`📡 CORS: ${allowedOrigins.length} origins allowed`);

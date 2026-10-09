@@ -1,0 +1,16 @@
+/* Reject button, late badge, reject panel and refund list inside the payment verification modal */
+.org-pay-action{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.org-reject-btn{font:700 12px 'Space Mono',monospace;text-transform:uppercase;letter-spacing:.04em;padding:9px 12px;border:3px solid #0a0a0a;background:#fff;color:#0a0a0a;cursor:pointer;box-shadow:3px 3px 0 #0a0a0a}
+.org-reject-btn:hover{background:#FF3B30;color:#fff}
+.org-reject-btn:disabled{opacity:.5;cursor:not-allowed}
+.org-tag-late{margin-left:6px;font:700 10px 'Space Mono',monospace;padding:2px 6px;border:2px solid #0a0a0a;background:#FFE500;vertical-align:middle}
+.org-reject-panel{border:3px solid #0a0a0a;background:#fff4f2;padding:12px 14px;margin:-4px 0 12px;display:grid;gap:8px}
+.org-reject-panel label{font:700 12px 'Space Mono',monospace;text-transform:uppercase}
+.org-reject-panel textarea{width:100%;min-height:64px;padding:8px 10px;border:3px solid #0a0a0a;font:15px 'Space Grotesk',sans-serif;background:#fff;resize:vertical}
+.org-reject-panel .hint{margin:0;font-size:13px;color:#4a4a4a}
+.org-reject-panel .row{display:flex;gap:8px;flex-wrap:wrap}
+.org-late-note{font-size:13px;color:#4a4a4a;margin:-4px 0 10px;padding-left:4px}
+.org-refund-box{border:3px solid #0a0a0a;background:#fffbe6;padding:14px;margin-top:16px;display:grid;gap:10px}
+.org-refund-box h4{margin:0;font:700 14px 'Space Mono',monospace;text-transform:uppercase}
+.org-refund-box p{margin:0;font-size:14px;color:#3b3b3b}
+.org-refund-row{display:flex;gap:10px;align-items:center;justify-content:space-between;flex-wrap:wrap;border-top:2px solid #0a0a0a;padding-top:10px;font-size:14px}

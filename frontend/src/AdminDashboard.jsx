@@ -22,6 +22,7 @@ const TABS = [
   { id: 'events',     label: 'Events',      icon: 'fa-calendar-alt' },
   { id: 'users',      label: 'Users',       icon: 'fa-users' },
   { id: 'organizers', label: 'Organisers',  icon: 'fa-crown' },
+  { id: 'clubs',      label: 'Clubs',       icon: 'fa-users-cog' },
 ];
 
 export default function AdminDashboard() {
@@ -41,14 +42,19 @@ export default function AdminDashboard() {
   const [users, setUsers]                   = useState([]);
   const [organizers, setOrganizers]         = useState([]);
   const [loading, setLoading]               = useState({
-    overview: true, requests: true, events: true, users: true, organizers: true,
+    overview: true, requests: true, events: true, users: true, organizers: true, clubs: true,
   });
   const [actionLoading, setActionLoading]   = useState({});
   const [toast, setToast]                   = useState({ show: false, message: '', isError: false });
 
   // ── Role edit state ────────────────────────────────────────
-  const [editingRole, setEditingRole]       = useState(null); // { usn, role_in_club, club_name }
-  const [roleFormData, setRoleFormData]     = useState({ role_in_club: '', club_name: '' });
+  // Clubs tab state
+  const [clubs, setClubs]               = useState([]);
+  const [expandedClub, setExpandedClub] = useState(null);
+  const [limitInputs, setLimitInputs]   = useState({});    // cid -> text in the limit box
+  const [presInputs, setPresInputs]     = useState({});    // cid -> text in the president box
+  const [nameInputs, setNameInputs]     = useState({});    // cid -> text in the club name box
+  const [editingMember, setEditingMember] = useState(null); // { cid, usn, role }
 
   // ── Helpers ────────────────────────────────────────────────
   const showToast = (message, isError = false) => {
@@ -124,13 +130,33 @@ export default function AdminDashboard() {
     }
   }, []);
 
+  const fetchClubs = useCallback(async () => {
+    setTabLoading('clubs', true);
+    try {
+      const res = await adminFetch('/api/admin/clubs');
+      if (res.ok) {
+        const data = await res.json();
+        setClubs(data.clubs || []);
+      } else {
+        console.error('Clubs fetch failed:', res.status);
+        setClubs([]);
+      }
+    } catch (e) {
+      console.error('Clubs fetch error:', e);
+      setClubs([]);
+    } finally {
+      setTabLoading('clubs', false);
+    }
+  }, []);
+
   const fetchAllData = useCallback(() => {
     fetchStats();
     fetchRequests('pending');
     fetchEvents();
     fetchUsers();
     fetchOrganizers();
-  }, [fetchStats, fetchRequests, fetchEvents, fetchUsers, fetchOrganizers]);
+    fetchClubs();
+  }, [fetchStats, fetchRequests, fetchEvents, fetchUsers, fetchOrganizers, fetchClubs]);
 
   // ── Auth Check ─────────────────────────────────────────────
   useEffect(() => {
@@ -195,6 +221,7 @@ export default function AdminDashboard() {
         fetchRequests(requestFilter);
         fetchStats();
         fetchOrganizers();
+        fetchClubs();
       } else {
         showToast(data.error || 'Failed to approve', true);
       }
@@ -206,9 +233,12 @@ export default function AdminDashboard() {
   };
 
   const handleReject = async (id) => {
+    // optional reason: the student sees it on their request page (and gets it by email)
+    const reason = window.prompt('Reason for rejecting (optional). The student will see it:', '');
+    if (reason === null) return;                         // admin pressed Cancel
     setActionLoading(prev => ({ ...prev, [id]: 'rejecting' }));
     try {
-      const res = await adminFetch(`/api/admin/organizer-requests/${id}/reject`, { method: 'POST' });
+      const res = await adminFetch(`/api/admin/organizer-requests/${id}/reject`, { method: 'POST', body: JSON.stringify({ reason: reason.trim() }) });
       const data = await res.json();
       if (res.ok) {
         showToast('Request rejected');
@@ -253,6 +283,7 @@ export default function AdminDashboard() {
       if (res.ok) {
         showToast('Organizer status revoked');
         fetchOrganizers();
+        fetchClubs();
         fetchStats();
       } else {
         showToast(data.error || 'Failed', true);
@@ -264,37 +295,75 @@ export default function AdminDashboard() {
     }
   };
 
-  const handleOpenRoleEdit = (org) => {
-    setEditingRole(org.usn);
-    setRoleFormData({ role_in_club: org.role_in_club || '', club_name: org.club_name || '' });
-  };
-
-  const handleSaveRole = async (usn) => {
-    if (!roleFormData.role_in_club.trim()) {
-      showToast('Role cannot be empty', true);
-      return;
-    }
-    setActionLoading(prev => ({ ...prev, [`role_${usn}`]: true }));
+  // ----- Clubs tab actions -----
+  const clubCall = async (key, url, method, body, okMsg) => {
+    setActionLoading(prev => ({ ...prev, [key]: true }));
     try {
-      const res = await adminFetch(`/api/admin/organizers/${usn}/update-role`, {
-        method: 'POST',
-        body: JSON.stringify({
-          role_in_club: roleFormData.role_in_club.trim(),
-          club_name: roleFormData.club_name.trim(),
-        }),
-      });
-      const data = await res.json();
-      if (res.ok) {
-        showToast('Role updated successfully');
-        setEditingRole(null);
-        fetchOrganizers();
-      } else {
-        showToast(data.error || 'Failed to update role', true);
-      }
+      const res = await adminFetch(url, { method, body: body ? JSON.stringify(body) : undefined });
+      const data = await res.json().catch(() => ({}));
+      if (res.ok) { if (okMsg) showToast(okMsg); return data; }
+      showToast(data.error || 'Something went wrong', true);
     } catch {
       showToast('Network error', true);
     } finally {
-      setActionLoading(prev => ({ ...prev, [`role_${usn}`]: null }));
+      setActionLoading(prev => ({ ...prev, [key]: null }));
+    }
+    return null;
+  };
+
+  const handleSaveLimit = async (c) => {
+    const value = parseInt(limitInputs[c.cid] ?? c.maxmembers, 10);
+    const ok = await clubCall(`limit_${c.cid}`, `/api/admin/clubs/${c.cid}/max-members`, 'PUT', { maxMembers: value }, 'Club limit updated');
+    if (ok) fetchClubs();
+  };
+
+  const handleSaveClubName = async (c) => {
+    const name = (nameInputs[c.cid] ?? c.cname).trim();
+    const ok = await clubCall(`name_${c.cid}`, `/api/admin/clubs/${c.cid}/name`, 'PUT', { name }, 'Club name updated');
+    if (ok) {
+      setNameInputs(prev => {
+        const next = { ...prev };
+        delete next[c.cid];
+        return next;
+      });
+      fetchClubs();
+      fetchOrganizers();
+      fetchRequests(requestFilter);
+    }
+  };
+
+  const handleDeleteClub = async (c) => {
+    if (!window.confirm(`Delete club "${c.cname}"? Its organisers will be removed and events will no longer be linked to this club.`)) return;
+    const data = await clubCall(`delete_${c.cid}`, `/api/admin/clubs/${c.cid}`, 'DELETE', null, null);
+    if (data) {
+      showToast('Club deleted');
+      setExpandedClub(null);
+      fetchClubs();
+      fetchOrganizers();
+      fetchRequests(requestFilter);
+      fetchEvents();
+    }
+  };
+
+  const handleSavePresident = async (c) => {
+    const usn = (presInputs[c.cid] ?? c.clubprezusn ?? '').trim();
+    const ok = await clubCall(`pres_${c.cid}`, `/api/admin/clubs/${c.cid}/president`, 'PUT', { usn }, usn ? 'President saved' : 'President cleared');
+    if (ok) fetchClubs();
+  };
+
+  const handleSaveMemberRole = async () => {
+    const m = editingMember;
+    if (!m || !m.role.trim()) { showToast('Role cannot be empty', true); return; }
+    const ok = await clubCall(`role_${m.cid}_${m.usn}`, `/api/admin/clubs/${m.cid}/members/${m.usn}/role`, 'PUT', { role: m.role.trim() }, 'Role updated');
+    if (ok) { setEditingMember(null); fetchClubs(); fetchOrganizers(); }
+  };
+
+  const handleRemoveMember = async (c, m) => {
+    if (!window.confirm(`Remove ${m.name} as an organiser of ${c.cname}?`)) return;
+    const data = await clubCall(`rm_${c.cid}_${m.usn}`, `/api/admin/clubs/${c.cid}/members/${m.usn}`, 'DELETE', null, null);
+    if (data) {
+      showToast(data.organiserAccessRemoved ? `${m.name} removed. They are no longer an organiser.` : `${m.name} removed from ${c.cname}`);
+      fetchClubs(); fetchOrganizers(); fetchStats();
     }
   };
 
@@ -436,6 +505,12 @@ export default function AdminDashboard() {
                       <span className="adm-field-key">Submitted</span>
                       <span className="adm-field-val">{fmt(r.created_at)}</span>
                     </div>
+                    {r.reject_reason && (
+                      <div className="adm-request-field">
+                        <span className="adm-field-key">Reason</span>
+                        <span className="adm-field-val">{r.reject_reason}</span>
+                      </div>
+                    )}
                   </div>
                   {requestFilter === 'pending' && (
                     <div className="adm-request-actions">
@@ -572,16 +647,12 @@ export default function AdminDashboard() {
     <div className="adm-organizers">
       <div className="adm-section-header">
         <div className="adm-section-title">Approved Organisers</div>
-        <button
-          className="adm-refresh-btn"
-          onClick={fetchOrganizers}
-          disabled={loading.organizers}
-          title="Refresh list"
-        >
+        <button className="adm-refresh-btn" onClick={fetchOrganizers} disabled={loading.organizers} title="Refresh list">
           <i className={`fas fa-sync-alt ${loading.organizers ? 'fa-spin' : ''}`}></i>
           Refresh
         </button>
       </div>
+      <p className="adm-hint">To change a role or remove someone from one club, use the Clubs tab.</p>
 
       {loading.organizers
         ? <div className="adm-loading"><div className="adm-spinner"></div></div>
@@ -605,104 +676,149 @@ export default function AdminDashboard() {
                       ORGANISER
                     </span>
                   </div>
-
-                  {/* ── Role Edit Form (inline) ── */}
-                  {editingRole === o.usn ? (
-                    <div className="adm-role-edit-form">
-                      <div className="adm-role-edit-title">
-                        <i className="fas fa-edit" style={{ marginRight: '6px' }}></i>
-                        Edit Organiser Details
-                      </div>
-                      <div className="adm-role-edit-fields">
-                        <div className="adm-role-field-group">
-                          <label className="adm-field-key">Role in Club</label>
-                          <input
-                            className="adm-role-input"
-                            value={roleFormData.role_in_club}
-                            onChange={e => setRoleFormData(p => ({ ...p, role_in_club: e.target.value }))}
-                            placeholder="e.g. Vice President, Lead Coordinator"
-                          />
-                        </div>
-                        <div className="adm-role-field-group">
-                          <label className="adm-field-key">Club Name</label>
-                          <input
-                            className="adm-role-input"
-                            value={roleFormData.club_name}
-                            onChange={e => setRoleFormData(p => ({ ...p, club_name: e.target.value }))}
-                            placeholder="Club name"
-                          />
-                        </div>
-                      </div>
-                      <div className="adm-role-edit-actions">
-                        <button
-                          className="adm-approve-btn"
-                          onClick={() => handleSaveRole(o.usn)}
-                          disabled={!!actionLoading[`role_${o.usn}`]}
-                        >
-                          {actionLoading[`role_${o.usn}`] && <div className="adm-btn-spinner"></div>}
-                          Save Changes
-                        </button>
-                        <button
-                          className="adm-cancel-btn"
-                          onClick={() => setEditingRole(null)}
-                          disabled={!!actionLoading[`role_${o.usn}`]}
-                        >
-                          Cancel
-                        </button>
-                      </div>
+                  <div className="adm-request-grid">
+                    <div className="adm-request-field" style={{ gridColumn: '1 / -1' }}>
+                      <span className="adm-field-key">Clubs and roles</span>
+                      <span className="adm-field-val">
+                        {(o.clubs && o.clubs.length)
+                          ? o.clubs.map(c => `${c.club} (${c.role || 'no role set'})`).join(', ')
+                          : (o.club_name ? `${o.club_name} (${o.role_in_club || 'no role set'})` : '-')}
+                      </span>
                     </div>
-                  ) : (
-                    <div className="adm-request-grid">
-                      <div className="adm-request-field">
-                        <span className="adm-field-key">Club</span>
-                        <span className="adm-field-val">{o.club_name || '—'}</span>
-                      </div>
-                      <div className="adm-request-field">
-                        <span className="adm-field-key">Role</span>
-                        <span className="adm-field-val">{o.role_in_club || '—'}</span>
-                      </div>
-                      <div className="adm-request-field">
-                        <span className="adm-field-key">College</span>
-                        <span className="adm-field-val">{o.college_name || '—'}</span>
-                      </div>
-                      <div className="adm-request-field">
-                        <span className="adm-field-key">Events Organised</span>
-                        <span className="adm-field-val">{o.events_organized ?? 0}</span>
-                      </div>
-                      <div className="adm-request-field">
-                        <span className="adm-field-key">Email</span>
-                        <span className="adm-field-val">{o.emailid || '—'}</span>
-                      </div>
-                      <div className="adm-request-field">
-                        <span className="adm-field-key">Approved On</span>
-                        <span className="adm-field-val">{fmt(o.approved_at)}</span>
-                      </div>
+                    <div className="adm-request-field">
+                      <span className="adm-field-key">College</span>
+                      <span className="adm-field-val">{o.college_name || '-'}</span>
                     </div>
-                  )}
-
-                  {editingRole !== o.usn && (
-                    <div className="adm-request-actions">
-                      <button
-                        className="adm-edit-role-btn"
-                        onClick={() => handleOpenRoleEdit(o)}
-                        disabled={!!actionLoading[`org_${o.usn}`]}
-                        title="Edit role"
-                      >
-                        <i className="fas fa-edit"></i>
-                        Change Role
-                      </button>
-                      <button
-                        className="adm-reject-btn"
-                        onClick={() => handleRevokeOrganizer(o.usn, o.sname)}
-                        disabled={!!actionLoading[`org_${o.usn}`]}
-                      >
-                        {actionLoading[`org_${o.usn}`] === 'revoking' && <div className="adm-btn-spinner"></div>}
-                        Revoke Organiser
-                      </button>
+                    <div className="adm-request-field">
+                      <span className="adm-field-key">Events Organised</span>
+                      <span className="adm-field-val">{o.events_organized ?? 0}</span>
                     </div>
-                  )}
+                    <div className="adm-request-field">
+                      <span className="adm-field-key">Email</span>
+                      <span className="adm-field-val">{o.emailid || '-'}</span>
+                    </div>
+                    <div className="adm-request-field">
+                      <span className="adm-field-key">Approved On</span>
+                      <span className="adm-field-val">{fmt(o.approved_at)}</span>
+                    </div>
+                  </div>
+                  <div className="adm-request-actions">
+                    <button
+                      className="adm-reject-btn"
+                      onClick={() => handleRevokeOrganizer(o.usn, o.sname)}
+                      disabled={!!actionLoading[`org_${o.usn}`]}
+                      title="Removes them from every club"
+                    >
+                      {actionLoading[`org_${o.usn}`] === 'revoking' && <div className="adm-btn-spinner"></div>}
+                      Revoke from all clubs
+                    </button>
+                  </div>
                 </div>
               ))}
+            </div>
+          )
+      }
+    </div>
+  );
+
+  const renderClubs = () => (
+    <div className="adm-clubs">
+      <div className="adm-section-header">
+        <div className="adm-section-title">Clubs and their organisers</div>
+        <button className="adm-refresh-btn" onClick={fetchClubs} disabled={loading.clubs} title="Refresh list">
+          <i className={`fas fa-sync-alt ${loading.clubs ? 'fa-spin' : ''}`}></i>
+          Refresh
+        </button>
+      </div>
+
+      {loading.clubs
+        ? <div className="adm-loading"><div className="adm-spinner"></div></div>
+        : clubs.length === 0
+          ? (
+            <div className="adm-empty-state">
+              <div className="adm-empty-icon"><i className="fas fa-users-cog"></i></div>
+              <div className="adm-empty-title">No clubs yet</div>
+              <div className="adm-empty-sub">A club is created when you approve the first request for it.</div>
+            </div>
+          )
+          : (
+            <div className="adm-request-list">
+              {clubs.map(c => {
+                const open = expandedClub === c.cid;
+                const full = c.member_count >= c.maxmembers;
+                return (
+                  <div key={c.cid} className="adm-request-card">
+                    <div className="adm-request-top">
+                      <div className="adm-request-name">{c.cname}</div>
+                      <span className={`adm-club-count${full ? ' full' : ''}`}>{c.member_count} / {c.maxmembers} organisers</span>
+                      <button className="adm-edit-role-btn" onClick={() => setExpandedClub(open ? null : c.cid)}>
+                        <i className={`fas fa-chevron-${open ? 'up' : 'down'}`}></i>
+                        {open ? 'Hide' : 'Manage'}
+                      </button>
+                    </div>
+                    {c.president_name && <div className="adm-hint">President: {c.president_name} ({c.clubprezusn})</div>}
+
+                    {open && (
+                      <div className="adm-club-body">
+                        <div className="adm-club-row">
+                          <label className="adm-field-key" htmlFor={`name-${c.cid}`}>Club name</label>
+                          <input id={`name-${c.cid}`} className="adm-role-input"
+                            value={nameInputs[c.cid] ?? c.cname}
+                            onChange={e => setNameInputs(p => ({ ...p, [c.cid]: e.target.value }))} />
+                          <button className="adm-approve-btn" onClick={() => handleSaveClubName(c)} disabled={!!actionLoading[`name_${c.cid}`]}>Save name</button>
+                          <button className="adm-reject-btn" onClick={() => handleDeleteClub(c)} disabled={!!actionLoading[`delete_${c.cid}`]}>Delete club</button>
+                        </div>
+                        <div className="adm-club-row">
+                          <label className="adm-field-key" htmlFor={`lim-${c.cid}`}>Organiser limit</label>
+                          <input id={`lim-${c.cid}`} className="adm-role-input adm-club-num" type="number" min="1" max="1000"
+                            value={limitInputs[c.cid] ?? c.maxmembers}
+                            onChange={e => setLimitInputs(p => ({ ...p, [c.cid]: e.target.value }))} />
+                          <button className="adm-approve-btn" onClick={() => handleSaveLimit(c)} disabled={!!actionLoading[`limit_${c.cid}`]}>Save limit</button>
+                        </div>
+                        <div className="adm-club-row">
+                          <label className="adm-field-key" htmlFor={`pre-${c.cid}`}>President USN (optional)</label>
+                          <input id={`pre-${c.cid}`} className="adm-role-input adm-club-num" style={{ width: 150 }} maxLength={10}
+                            value={presInputs[c.cid] ?? c.clubprezusn ?? ''} placeholder="e.g. 1BM23CS001"
+                            onChange={e => setPresInputs(p => ({ ...p, [c.cid]: e.target.value.toUpperCase() }))} />
+                          <button className="adm-approve-btn" onClick={() => handleSavePresident(c)} disabled={!!actionLoading[`pres_${c.cid}`]}>Save</button>
+                        </div>
+
+                        <div className="adm-field-key" style={{ marginTop: 14 }}>Organisers in this club</div>
+                        {c.members.length === 0
+                          ? <div className="adm-hint">No organisers yet.</div>
+                          : c.members.map(m => {
+                            const editing = editingMember && editingMember.cid === c.cid && editingMember.usn === m.usn;
+                            return (
+                              <div key={m.usn} className="adm-member-row">
+                                <div className="adm-member-info">
+                                  <strong>{m.name}</strong> <span className="adm-request-usn">{m.usn}</span>
+                                  {!editing && <div className="adm-hint">Role: {m.role || 'not set'}{m.since ? ` · since ${fmt(m.since)}` : ''}</div>}
+                                </div>
+                                {editing ? (
+                                  <div className="adm-member-actions">
+                                    <input className="adm-role-input" value={editingMember.role} maxLength={100} placeholder="e.g. Vice President"
+                                      onChange={e => setEditingMember(p => ({ ...p, role: e.target.value }))} />
+                                    <button className="adm-approve-btn" onClick={handleSaveMemberRole} disabled={!!actionLoading[`role_${c.cid}_${m.usn}`]}>Save</button>
+                                    <button className="adm-cancel-btn" onClick={() => setEditingMember(null)}>Cancel</button>
+                                  </div>
+                                ) : (
+                                  <div className="adm-member-actions">
+                                    <button className="adm-edit-role-btn" onClick={() => setEditingMember({ cid: c.cid, usn: m.usn, role: m.role || '' })}>
+                                      <i className="fas fa-edit"></i> Edit role
+                                    </button>
+                                    <button className="adm-reject-btn" onClick={() => handleRemoveMember(c, m)} disabled={!!actionLoading[`rm_${c.cid}_${m.usn}`]}>
+                                      Remove
+                                    </button>
+                                  </div>
+                                )}
+                              </div>
+                            );
+                          })}
+                      </div>
+                    )}
+                  </div>
+                );
+              })}
             </div>
           )
       }
@@ -760,6 +876,7 @@ export default function AdminDashboard() {
           {activeTab === 'events'     && renderEvents()}
           {activeTab === 'users'      && renderUsers()}
           {activeTab === 'organizers' && renderOrganizers()}
+          {activeTab === 'clubs'      && renderClubs()}
         </div>
       </main>
     </div>

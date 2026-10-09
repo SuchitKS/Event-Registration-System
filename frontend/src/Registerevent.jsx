@@ -484,6 +484,8 @@ export default function Registerevent() {
   const [viewMode, setViewMode]                 = useState("gallery")
   const [teamStates, setTeamStates]             = useState({})
   const [registeredEvents, setRegisteredEvents] = useState(new Set())
+  const [pendingEvents, setPendingEvents]       = useState(new Set())   // registered, payment not yet approved
+  const [notices, setNotices]                   = useState({})          // eventId -> rejected / seat-taken notice
   const [flash, setFlash]                       = useState({ type:"", message:"" })
   const [modalFlash, setModalFlash]             = useState({ type:"", message:"" })
   const [selectedEvent, setSelectedEvent]       = useState(null)
@@ -529,7 +531,13 @@ export default function Registerevent() {
   const fetchMyRegistrations = useCallback(async () => {
     try {
       const res = await apiFetch('/api/my-participant-events');
-      if (res.ok) { const d = await res.json(); setRegisteredEvents(new Set(d.participantEvents.map(ev=>ev.eid))) }
+      if (res.ok) {
+        const d = await res.json();
+        setRegisteredEvents(new Set(d.participantEvents.map(ev=>ev.eid)))
+        setPendingEvents(new Set(d.participantEvents.filter(ev=>ev.payment_status==='pending_verification').map(ev=>ev.eid)))
+      }
+      const nr = await apiFetch('/api/my-payment-notices');
+      if (nr.ok) { const n = await nr.json(); setNotices(Object.fromEntries((n.notices||[]).map(x=>[x.eventId,x]))) }
     } catch (err) { console.error(err) }
   }, []);
 
@@ -762,8 +770,14 @@ export default function Registerevent() {
     try {
       const r = await apiFetch(url,{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({transaction_id:transactionId.trim()})});
       const d = await r.json()
-      if (!r.ok) { showModalFlash('error',d.error); return }
-      showModalFlash('success','Submitted for verification!');
+      if (!r.ok) {
+        showModalFlash('error',d.error)
+        if (d.code==='SEAT_TAKEN' || d.code==='NO_SEAT') {   // seat is gone: close shortly and refresh
+          setTimeout(async()=>{ setShowUpiModal(null); setTransactionId(""); await loadEvents(); await fetchMyRegistrations() },5000)
+        }
+        return
+      }
+      showModalFlash('success', d.late ? 'Submitted. The organiser will confirm your late payment.' : 'Submitted for verification!');
       setTimeout(async()=>{
         setShowUpiModal(null); setTransactionId(""); showFlash('success','Submitted!');
         setTicketInfo({eventName:event.ename,eventDate:event.eventDate,userUSN:d.userUSN||"PENDING"});
@@ -782,10 +796,24 @@ export default function Registerevent() {
     if (!ts && event.status!=='completed') return <button className="registerevent-btn disabled">Loading...</button>
     if (event.status==='completed')        return <button className="registerevent-btn disabled">Event Completed</button>
     if (!ts?.isTeamEvent) {
-      if (registeredEvents.has(event.eid)) return <div className="registerevent-btn-group"><button className="registerevent-btn success" disabled>✓ Registered</button>{aboutBtn}</div>
+      if (registeredEvents.has(event.eid)) return <div className="registerevent-btn-group"><button className="registerevent-btn success" disabled>{pendingEvents.has(event.eid) ? '⏳ Awaiting approval' : '✓ Registered'}</button>{aboutBtn}</div>
       const isPaid = (event.regFee || 0) > 0;
       const btnLabel = isPaid ? `Pay ₹${event.regFee}` : "Register";
-      return <div className="registerevent-btn-group"><button className="registerevent-btn primary" onClick={e=>{e.stopPropagation();handleRegister(event);}}>{btnLabel}</button>{aboutBtn}</div>
+      const notice = notices[event.eid]
+      return (
+        <div style={{width:'100%'}}>
+          {notice && (
+            <div style={{border:'3px solid #0a0a0a',background:'#fff4f2',padding:'10px 12px',marginBottom:10,fontSize:14,lineHeight:1.4,color:'#0a0a0a',textAlign:'left'}}>
+              <strong>{notice.status==='rejected' ? 'Payment rejected' : 'Seat no longer available'}</strong>
+              {notice.status==='rejected'
+                ? <>{notice.reason ? `: ${notice.reason}` : '.'} You can register again.</>
+                : <> Your payment arrived after your seat was given to the next person. Please contact the organiser for a refund.</>}
+              {notice.contactPhone && <div style={{marginTop:4}}>Need help? Call {notice.contactName ? notice.contactName+' ' : ''}<a href={`tel:${notice.contactPhone}`} style={{color:'#0047FF',fontWeight:700}}>{notice.contactPhone}</a></div>}
+            </div>
+          )}
+          <div className="registerevent-btn-group"><button className="registerevent-btn primary" onClick={e=>{e.stopPropagation();handleRegister(event);}}>{btnLabel}</button>{aboutBtn}</div>
+        </div>
+      )
     }
     if (ts.registrationComplete) return <div className="registerevent-btn-group"><button className="registerevent-btn success" disabled>✓ Team Registered</button>{aboutBtn}</div>
     if (ts.hasJoinedTeam) {
@@ -843,16 +871,20 @@ export default function Registerevent() {
       {activeQueueEvent && (
         <div className="registerevent-modal-overlay" onClick={handleCloseQueueModal}>
           <div className="registerevent-modal" onClick={e => e.stopPropagation()}>
-            <div className="registerevent-modal-header" style={{ marginBottom: "16px" }}>
+            <div className="registerevent-modal-header">
               <h2 className="registerevent-modal-title">Queue Status</h2>
               <button className="registerevent-modal-close" onClick={handleCloseQueueModal}>×</button>
             </div>
-            <QueueStatus
-              eventId={activeQueueEvent.event.eid}
-              initialData={activeQueueEvent.claimData}
-              onSeatAvailable={() => handleSeatAvailable(activeQueueEvent.event)}
-              onExpired={handleQueueExpired}
-            />
+            <div className="registerevent-modal-body">
+              <QueueStatus
+                eventId={activeQueueEvent.event.eid}
+                initialData={activeQueueEvent.claimData}
+                onSeatAvailable={() => handleSeatAvailable(activeQueueEvent.event)}
+                onExpired={handleQueueExpired}
+                contactPhone={activeQueueEvent.event.contactPhone}
+                contactName={activeQueueEvent.event.contactName}
+              />
+            </div>
           </div>
         </div>
       )}
@@ -953,6 +985,8 @@ export default function Registerevent() {
                 <div className="registerevent-bento-grid">
                   <div className="registerevent-bento-item"><span className="bento-label">Venue</span><span className="bento-value">{selectedEvent.eventLoc}</span></div>
                   <div className="registerevent-bento-item"><span className="bento-label">Organizer</span><span className="bento-value">{selectedEvent.organizerName||"Club"}</span></div>
+                  {selectedEvent.contactPhone && <div className="registerevent-bento-item"><span className="bento-label">Contact</span><span className="bento-value"><a href={`tel:${selectedEvent.contactPhone}`} style={{color:'inherit'}}>{selectedEvent.contactName ? `${selectedEvent.contactName} · ` : ''}{selectedEvent.contactPhone}</a></span></div>}
+                  {selectedEvent.whatsappLink && registeredEvents.has(selectedEvent.eid) && <div className="registerevent-bento-item"><span className="bento-label">WhatsApp</span><span className="bento-value"><a href={selectedEvent.whatsappLink} target="_blank" rel="noopener noreferrer" style={{color:'inherit'}}>Join group ↗</a></span></div>}
                   {selectedEvent.is_team && <div className="registerevent-bento-item"><span className="bento-label">Team Size</span><span className="bento-value">{selectedEvent.min_team_size} - {selectedEvent.max_team_size} Members</span></div>}
                 </div>
                 <div style={{height:'24px'}}></div>
@@ -973,7 +1007,7 @@ export default function Registerevent() {
             </div>
             <div className="registerevent-modal-body">
               {modalFlash.message && (
-                <div className={`flo-toast ${modalFlash.type==='error'?"flo-toast--error":"flo-toast--success"}`} style={{position:'relative',top:0,left:0,transform:'none',width:'auto',marginBottom:'16px'}}>
+                <div className={`flo-toast ${modalFlash.type==='error'?"flo-toast--error":"flo-toast--success"}`} style={{position:'relative',top:0,left:0,transform:'none',width:'100%',boxSizing:'border-box',marginBottom:'16px',animation:'none',textAlign:'center'}}>
                   <span className="flo-toast-icon">{modalFlash.type==='error'?"✕":"✓"}</span>{modalFlash.message}
                 </div>
               )}
@@ -1026,7 +1060,7 @@ export default function Registerevent() {
             </div>
             <div className="registerevent-modal-body" style={{textAlign:'center'}}>
               {modalFlash.message && (
-                <div className={`flo-toast ${modalFlash.type==='error'?"flo-toast--error":"flo-toast--success"}`} style={{position:'relative',top:0,left:0,transform:'none',width:'auto',marginBottom:'16px'}}>
+                <div className={`flo-toast ${modalFlash.type==='error'?"flo-toast--error":"flo-toast--success"}`} style={{position:'relative',top:0,left:0,transform:'none',width:'100%',boxSizing:'border-box',marginBottom:'16px',animation:'none',textAlign:'center'}}>
                   <span className="flo-toast-icon">{modalFlash.type==='error'?"✕":"✓"}</span>{modalFlash.message}
                 </div>
               )}
@@ -1034,6 +1068,12 @@ export default function Registerevent() {
               <p style={{color:'var(--nb-black)',marginBottom:'20px',fontFamily:'var(--nb-font-mono)',fontSize:'13px',fontWeight:700}}>Pay <strong>₹{showUpiModal.event.regFee}</strong></p>
               <div className="registerevent-payment-details"><div className="registerevent-payment-row"><span style={{color:'#888'}}>UPI ID</span><span className="registerevent-payment-value">{showUpiModal.event.upiId}</span></div></div>
               <input className="registerevent-form-input" placeholder="Transaction ID (UTR)" value={transactionId} onChange={e=>setTransactionId(e.target.value)} disabled={isSubmitting} />
+              {showUpiModal?.event?.contactPhone && (
+                <p style={{margin:'10px 0 0',fontSize:13,color:'#333'}}>
+                  Doubt or payment problem? Call {showUpiModal.event.contactName ? showUpiModal.event.contactName+' ' : 'the organiser '}
+                  <a href={`tel:${showUpiModal.event.contactPhone}`} style={{color:'#0047FF',fontWeight:700}}>{showUpiModal.event.contactPhone}</a>
+                </p>
+              )}
               <button className="registerevent-modal-submit-btn" style={{marginTop:'16px'}} onClick={handleSubmitUpiPayment} disabled={isSubmitting}>{isSubmitting?"Verifying...":"Submit Payment"}</button>
             </div>
           </div>

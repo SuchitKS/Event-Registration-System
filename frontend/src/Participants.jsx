@@ -7,6 +7,8 @@ import { apiFetch } from './api.js';
 
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
+import { generateCertificatePdf } from './certificatePdf.js';
+import { buildCertData, normalizeLayout } from './certificateLib.js';
 
 let cachedFontBytes = null;
 
@@ -117,6 +119,24 @@ const Participants = () => {
     setGeneratingIds(prev => new Set(prev).add(event.eid));
 
     try {
+      // New certificate system: layout is designed by the organiser and released by them.
+      if (event.certificateEnabled) {
+        const r = await apiFetch(`/api/events/${event.eid}/certificate`, { method: 'GET' });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) { alert(j.error || 'Certificate is not available yet.'); return; }
+        const data = buildCertData({
+          name: userInfo.userName, usn: userInfo.userUSN, event: event.ename,
+          date: event.eventDate, points: event.earnedActivityPts, customText: j.certificateInfo,
+        });
+        const bytes = await generateCertificatePdf({ template: j.template, layout: normalizeLayout(j.template, j.layout), data });
+        const url = window.URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
+        setDownloadLinks(prev => ({
+          ...prev,
+          [event.eid]: { url, filename: `Certificate_${userInfo.userUSN || event.eid}.pdf` },
+        }));
+        return;
+      }
+
       if (!event.PartStatus) {
         alert('Certificate is only available for attended events.');
         setGeneratingIds(prev => { const next = new Set(prev); next.delete(event.eid); return next; });
@@ -193,6 +213,11 @@ const Participants = () => {
     }
   };
 
+  // Legacy events: attended only. New events: organiser must release (to present / to all registered).
+  const canGetCert = (ev) => ev.certificateEnabled
+    ? !!ev.certificateReleased && (ev.certificateReleaseMode === 'all' || ev.PartStatus)
+    : ev.PartStatus;
+
   const counts = useMemo(() => ({
     all: events.ongoing.length + events.completed.length + events.upcoming.length,
     upcoming: events.upcoming.length,
@@ -244,7 +269,7 @@ const Participants = () => {
               </button>
             )}
 
-            {(type === 'completed' && event.PartStatus) && (
+            {(type === 'completed' && canGetCert(event)) && (
               generatingIds.has(event.eid) ? (
                 <button className="part-action-chip cert-btn" disabled>
                   <i className="fas fa-spinner fa-spin"></i> Generating...
@@ -258,6 +283,13 @@ const Participants = () => {
                   <i className="fas fa-certificate"></i> View Cert
                 </button>
               )
+            )}
+
+            {event.whatsappLink && (
+              <a className="part-attend-chip registered" href={event.whatsappLink} target="_blank" rel="noopener noreferrer"><i className="fab fa-whatsapp"></i> WhatsApp group</a>
+            )}
+            {type === 'completed' && event.certificateEnabled && !event.certificateReleased && event.PartStatus && (
+              <span className="part-attend-chip registered"><i className="fas fa-hourglass-half"></i> Certificate pending</span>
             )}
           </div>
         </div>

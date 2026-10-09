@@ -1,10 +1,21 @@
 import React, { useState, useEffect } from 'react';
+import { createPortal } from 'react-dom';
 import { useNavigate } from 'react-router-dom';
+import CertificateEditor from './CertificateEditor.jsx';
+import CertificateCanvas from './CertificateCanvas.jsx';
+import { TEMPLATES, SAMPLE_STUDENTS, defaultLayout, normalizeLayout, buildCertData } from './certificateLib.js';
 import './event_form.css';
 import { apiFetch } from './api.js';
 
 const EventForm = () => {
   const navigate = useNavigate();
+
+  // Certificate options
+  const [certEnabled, setCertEnabled] = useState(false);
+  const [certTemplate, setCertTemplate] = useState('teal');
+  const [certLayout, setCertLayout] = useState(null); // null = template default
+  const [showCertEditor, setShowCertEditor] = useState(false);
+  const [volCert, setVolCert] = useState({ mode: 'same', template: null, layout: null });
 
   const [formData, setFormData] = useState({
     eventName: '',
@@ -27,6 +38,8 @@ const EventForm = () => {
     minPartScans: '',
     minVolnScans: '',
     whatsappLink: '',
+    contactPhone: '',
+    contactName: '',
   });
 
   const [bannerFile, setBannerFile]       = useState(null);
@@ -35,6 +48,20 @@ const EventForm = () => {
   const [myClubs, setMyClubs]             = useState([]);
   const [isLoadingClubs, setIsLoadingClubs] = useState(true);
   const [activeSection, setActiveSection] = useState(1);
+
+  /* ── prefill the participants' contact number from the organiser's profile ── */
+  useEffect(() => {
+    (async () => {
+      try {
+        const res = await apiFetch('/api/me');
+        if (res.ok) {
+          const me = await res.json();
+          const m = String(me.mobile || '').replace(/\D/g, '').slice(-10);
+          if (m) setFormData((f) => (f.contactPhone ? f : { ...f, contactPhone: m }));
+        }
+      } catch (_) { /* optional */ }
+    })();
+  }, []);
 
   /* ── fetch organiser's clubs ── */
   useEffect(() => {
@@ -117,11 +144,30 @@ const EventForm = () => {
       return;
     }
 
+    const phone = String(formData.contactPhone || '').replace(/\D/g, '');
+    if (!/^\d{10}$/.test(phone)) {
+      showMessage('Please enter a valid 10-digit contact number for participants (Communication section).', true);
+      setIsSubmitting(false);
+      return;
+    }
+
     const submissionData = new FormData();
+    submissionData.append('contactPhone', phone);
+    submissionData.append('contactName', (formData.contactName || '').trim());
     submissionData.append('eventName',        formData.eventName);
     submissionData.append('eventDescription', formData.eventDescription);
     submissionData.append('certificate_info', formData.certificateInfo || '');
     submissionData.append('posterUrl',        formData.posterUrl || '');
+    submissionData.append('certificate_enabled',  certEnabled ? 'true' : 'false');
+    if (certEnabled) {
+      submissionData.append('certificate_template', certTemplate);
+      submissionData.append('certificate_layout',   JSON.stringify(certLayout || defaultLayout(certTemplate)));
+      submissionData.append('volunteer_certificate_mode', volCert.mode);
+      if (volCert.mode === 'separate' && volCert.layout) {
+        submissionData.append('volunteer_certificate_template', volCert.template || certTemplate);
+        submissionData.append('volunteer_certificate_layout',   JSON.stringify(volCert.layout));
+      }
+    }
     submissionData.append('eventDate',        formData.eventDate);
     submissionData.append('eventTime',        formData.eventTime);
     submissionData.append('eventLocation',    formData.eventLocation);
@@ -519,19 +565,52 @@ const EventForm = () => {
               </div>
               <div className="section-body">
 
-                <div className="input-group">
-                  <label className="input-label">
-                    Certificate Information <span>(Optional)</span>
+                <div className="cert-opt">
+                  <label className="ce-chk">
+                    <input type="checkbox" checked={certEnabled} onChange={(e) => setCertEnabled(e.target.checked)} />
+                    Provide a certificate for this event
                   </label>
-                  <textarea
-                    className="modern-textarea"
-                    name="certificateInfo"
-                    placeholder="Text to be displayed on the certificate…"
-                    value={formData.certificateInfo}
-                    onChange={handleChange}
-                    rows="2"
-                  />
+                  {certEnabled && (
+                    <div className="cert-row">
+                      <div className="cert-th">
+                        <CertificateCanvas
+                          template={certTemplate}
+                          layout={normalizeLayout(certTemplate, certLayout)}
+                          data={buildCertData({ ...SAMPLE_STUDENTS[0], event: formData.eventName || 'Event name', date: formData.eventDate, points: formData.maxActivityPts || 5, customText: formData.certificateInfo })}
+                        />
+                      </div>
+                      <div style={{ flex: 1, minWidth: 180 }}>
+                        <h4>Certificate ready</h4>
+                        <p>{certLayout ? 'Customised layout.' : 'Default layout.'} Set it up to change the template, text and signatures.</p>
+                      </div>
+                      <button type="button" className="ce-btn b" onClick={() => setShowCertEditor(true)}>Set up certificate →</button>
+                    </div>
+                  )}
                 </div>
+                {showCertEditor && createPortal(
+                  <CertificateEditor
+                    template={certTemplate}
+                    layout={certLayout}
+                    customText={formData.certificateInfo}
+                    eventName={formData.eventName}
+                    eventDate={formData.eventDate}
+                    points={formData.maxActivityPts || 5}
+                    volPoints={formData.volActivityPts || 5}
+                    volunteerMode={volCert.mode}
+                    volunteerTemplate={volCert.template}
+                    volunteerLayout={volCert.layout}
+                    backLabel="Back to form"
+                    saveLabel="Save & return"
+                    onSave={({ template, layout, customText, volunteerMode, volunteerTemplate, volunteerLayout }) => {
+                      setCertTemplate(template); setCertLayout(layout);
+                      setVolCert({ mode: volunteerMode, template: volunteerTemplate, layout: volunteerLayout });
+                      setFormData((f) => ({ ...f, certificateInfo: customText }));
+                      setShowCertEditor(false);
+                    }}
+                    onClose={() => setShowCertEditor(false)}
+                  />,
+                  document.body
+                )}
 
                 <div className="event-form-info-note">
                   <span className="event-form-info-icon">📋</span>
@@ -616,6 +695,41 @@ const EventForm = () => {
                 <span className="section-label-text">Communication</span>
               </div>
               <div className="section-body">
+
+                <div className="input-group">
+                  <label className="input-label">
+                    Contact number for participants <span style={{ color: '#d62020' }}>*</span>
+                  </label>
+                  <input
+                    className="modern-input"
+                    type="tel"
+                    name="contactPhone"
+                    inputMode="numeric"
+                    maxLength={10}
+                    placeholder="10-digit mobile number"
+                    value={formData.contactPhone}
+                    onChange={handleChange}
+                    required
+                  />
+                  <p className="helper-text">
+                    Shown to students on the event page, in the queue and on payment screens, so they can call you with doubts.
+                  </p>
+                </div>
+
+                <div className="input-group">
+                  <label className="input-label">
+                    Contact person name <span>(Optional)</span>
+                  </label>
+                  <input
+                    className="modern-input"
+                    type="text"
+                    name="contactName"
+                    maxLength={60}
+                    placeholder="e.g. Rahul (Treasurer)"
+                    value={formData.contactName}
+                    onChange={handleChange}
+                  />
+                </div>
 
                 <div className="input-group">
                   <label className="input-label">

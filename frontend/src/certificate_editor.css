@@ -1,0 +1,96 @@
+/* ── Fonts (same files are embedded in the PDF) ─────────────────────────── */
+@font-face{font-family:'CertAllura';src:url('/Allura-Regular.ttf');font-display:swap}
+@font-face{font-family:'CertPlayfair';src:url('/PlayfairDisplay-MediumItalic.ttf');font-display:swap}
+@font-face{font-family:'CertMeie';src:url('/MeieScript-Regular.ttf');font-display:swap}
+@font-face{font-family:'CertCormorant';src:url('/CormorantInfant-SemiBold.ttf');font-display:swap}
+
+/* ── Certificate canvas ──────────────────────────────────────────────────── */
+.cc-canvas{position:relative;width:100%;aspect-ratio:11/8.5;container-type:inline-size;overflow:hidden;
+  background-size:100% 100%;background-repeat:no-repeat;user-select:none;touch-action:none}
+.cc-el{position:absolute;line-height:1.15;white-space:pre-wrap}
+.cc-live .cc-el{cursor:move}
+.cc-live .cc-el:hover{outline:1px dashed #0047FF}
+.cc-live .cc-el.cc-sel{outline:2px solid #0047FF}
+.cc-text,.cc-line{display:flex;align-items:center}
+.cc-text span{width:100%}
+.cc-ln{display:block;width:100%;height:.18cqw}
+.cc-img img{width:100%;height:100%;object-fit:contain}
+.cc-ph{display:flex;width:100%;height:100%;align-items:center;justify-content:center;border:2px dashed currentColor;
+  font:500 12px 'Space Grotesk',sans-serif;opacity:.8;text-align:center}
+.cc-sg{height:100%;display:flex;flex-direction:column;justify-content:flex-end}
+.cc-sgi{flex:1;min-height:0;display:flex;align-items:center;justify-content:center}
+.cc-sgi img{max-height:100%;max-width:70%;object-fit:contain}
+.cc-sgi .cc-ph{width:70%;height:80%}
+.cc-sl{display:block;height:.12cqw;background:currentColor;margin:.2em 0}
+.cc-sg small{font-size:.8em}
+.cc-rz{display:none;position:absolute;right:-8px;bottom:-8px;width:16px;height:16px;background:#0047FF;border:2px solid #fff;cursor:nwse-resize}
+.cc-el.cc-sel .cc-rz{display:block}
+.cc-canvas mark{background:rgba(255,229,0,.6);color:inherit;padding:0 .1em}
+
+/* ── Editor overlay ──────────────────────────────────────────────────────── */
+.ce-root{--ce-b:3px solid #0a0a0a;--ce-sh:4px 4px 0 #0a0a0a;position:fixed;inset:0;z-index:2000;overflow:auto;
+  background-color:#f5f0e8;background-image:radial-gradient(circle,rgba(10,10,10,.07) 1px,transparent 1px);background-size:22px 22px;
+  font:14px/1.45 'Space Grotesk',sans-serif;color:#0a0a0a}
+.ce-root *,.ce-root *::before,.ce-root *::after{box-sizing:border-box}
+.ce-root button,.ce-root input,.ce-root select,.ce-root textarea{font:inherit;color:inherit}
+.ce-bar{display:flex;gap:10px;align-items:center;flex-wrap:wrap;padding:12px 16px;background:#fff;border-bottom:var(--ce-b);position:sticky;top:0;z-index:3}
+.ce-title{font:700 15px 'Space Mono',monospace;margin:0}
+.ce-sp{flex:1}
+.ce-btn{font:700 12px 'Space Mono',monospace;text-transform:uppercase;letter-spacing:.04em;padding:9px 13px;border:var(--ce-b);
+  background:#FFE500;box-shadow:var(--ce-sh);cursor:pointer;display:inline-block;border-radius:0}
+.ce-btn:hover{transform:translate(2px,2px);box-shadow:2px 2px 0 #0a0a0a}
+.ce-btn:disabled{opacity:.5;cursor:not-allowed}
+.ce-btn.w{background:#fff}.ce-btn.b{background:#0047FF;color:#fff}.ce-btn.r{background:#FF3B30}
+.ce-btn.sm{padding:6px 9px;font-size:11px;box-shadow:3px 3px 0 #0a0a0a}
+.ce-work{display:grid;grid-template-columns:230px minmax(0,1fr) 270px;gap:16px;padding:16px;align-items:start}
+@media(max-width:1000px){.ce-work{grid-template-columns:1fr}}
+.ce-pn{background:#fff;border:var(--ce-b);box-shadow:var(--ce-sh);padding:14px;position:sticky;top:76px;max-height:calc(100vh - 100px);overflow-y:auto;scrollbar-width:none;-ms-overflow-style:none}
+.ce-pn::-webkit-scrollbar{display:none}
+.ce-pn h3{font:700 13px 'Space Mono',monospace;margin:0 0 10px}
+.ce-pn label{display:block;margin-bottom:10px;font-weight:500}
+.ce-pn input[type=text],.ce-pn input:not([type]),.ce-pn select,.ce-pn textarea{width:100%;margin-top:4px;padding:7px 8px;border:var(--ce-b);background:#fff;border-radius:0}
+.ce-pn input[type=range]{-webkit-appearance:none;appearance:none;width:100%;height:4px;background:#0a0a0a;outline:none;margin:10px 0;border-radius:2px}
+.ce-pn input[type=range]::-webkit-slider-thumb{-webkit-appearance:none;appearance:none;width:18px;height:18px;border-radius:50%;background:#0047FF;cursor:pointer;border:2px solid #0a0a0a}
+.ce-pn input[type=range]::-moz-range-thumb{width:18px;height:18px;border-radius:50%;background:#0047FF;cursor:pointer;border:2px solid #0a0a0a;box-sizing:border-box}
+.ce-muted{color:#555;margin:0;font-size:13px}
+.ce-row{display:flex;gap:8px;align-items:center;flex-wrap:wrap}
+.ce-stage{background:#fff;border:var(--ce-b);box-shadow:6px 6px 0 #0a0a0a;padding:12px}
+.ce-tpls{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px}
+.ce-tc{border:var(--ce-b);background:#fff;padding:5px;cursor:pointer}
+.ce-tc.on{background:#FFE500;box-shadow:var(--ce-sh)}
+.ce-adds{display:grid;grid-template-columns:1fr 1fr;gap:8px;margin-bottom:14px}
+.ce-chips{display:flex;flex-wrap:wrap;gap:6px;margin-bottom:14px}
+.ce-chip{font:700 11px 'Space Mono',monospace;padding:5px 8px;border:2px solid #0a0a0a;background:#f5f0e8;cursor:pointer;border-radius:0}
+.ce-chip:hover{background:#FFE500}
+.ce-sw{width:28px;height:28px;border:2px solid #0a0a0a;cursor:pointer;padding:0;border-radius:0}
+.ce-sw.on{outline:3px solid #0047FF;outline-offset:2px}
+.ce-al{width:34px;height:30px;border:2px solid #0a0a0a;background:#fff;font:700 12px 'Space Mono',monospace;cursor:pointer;border-radius:0}
+.ce-al.on{background:#0a0a0a;color:#fff}
+.ce-ov{position:fixed;inset:0;background:rgba(10,10,10,.6);display:flex;align-items:center;justify-content:center;padding:16px;z-index:2100}
+.ce-big{width:min(960px,100%);max-height:100%;overflow:auto;display:grid;gap:12px}
+.ce-toast{position:fixed;left:50%;bottom:20px;transform:translateX(-50%);background:#0a0a0a;color:#fff;font:700 12px 'Space Mono',monospace;padding:10px 14px;z-index:2200}
+.ce-pill{font:700 11px 'Space Mono',monospace;padding:4px 8px;border:2px solid #0a0a0a;background:#f5f0e8;display:inline-block}
+.ce-pill.ok{background:#00C851}
+
+/* ── Event form block ────────────────────────────────────────────────────── */
+.cert-opt{border:3px solid #0a0a0a;background:#fff;padding:14px;margin-top:14px;box-shadow:4px 4px 0 #0a0a0a}
+.cert-opt .ce-chk{display:flex;gap:10px;align-items:center;font-weight:700;margin:0}
+.cert-opt .ce-chk input{width:20px;height:20px;accent-color:#0a0a0a}
+.cert-opt .ce-tpls{margin:12px 0}
+
+.cert-row{display:flex;align-items:center;gap:20px;flex-wrap:wrap;border:3px solid #0a0a0a;background:#f4edda;padding:14px 18px;margin-top:14px;box-shadow:4px 4px 0 #0a0a0a}
+.cert-th{width:120px;flex:none;border:2px solid #0a0a0a}
+.cert-row h4{margin:0;font:700 14px 'Space Mono',monospace;text-transform:uppercase}
+.cert-row p{margin:2px 0 0;color:#4a4a4a;font-size:15px}
+
+/* option buttons (used instead of radio inputs so they always show which one is selected) */
+.ce-opt{display:flex;align-items:center;gap:10px;width:100%;text-align:left;border:3px solid #0a0a0a;background:#fff;padding:8px 10px;
+  font:600 13px 'Space Grotesk',sans-serif;cursor:pointer;border-radius:0;color:#0a0a0a}
+.ce-opt:hover{background:#f4edda}
+.ce-opt.on{background:#FFE500;box-shadow:3px 3px 0 #0a0a0a}
+.ce-opt-dot{width:16px;height:16px;flex:none;border:2px solid #0a0a0a;border-radius:50%;background:#fff}
+.ce-opt.on .ce-opt-dot{background:#0a0a0a;box-shadow:inset 0 0 0 3px #FFE500}
+
+.ce-vol{margin-top:16px;border:3px solid #0a0a0a;background:#f4edda;padding:14px;display:grid;gap:8px}
+.ce-vol h3{margin:0;font:700 13px 'Space Mono',monospace}
+.ce-volopts{display:grid;gap:6px;max-width:420px}

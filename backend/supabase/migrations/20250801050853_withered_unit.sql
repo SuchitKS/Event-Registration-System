@@ -36,7 +36,7 @@ CREATE TABLE IF NOT EXISTS student (
 -- Create club table
 CREATE TABLE IF NOT EXISTS club (
   cid SERIAL PRIMARY KEY,
-  cname VARCHAR(50) NOT NULL,
+  cname VARCHAR(255) NOT NULL,
   clubdesc VARCHAR(500),
   clubprezusn VARCHAR(10),
   maxmembers INTEGER DEFAULT 50

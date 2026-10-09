@@ -38,7 +38,7 @@
 .registerevent-flash {
   position: fixed; top: 16px; left: 50%;
   transform: translateX(-50%);
-  z-index: 9999; padding: 12px 28px;
+  z-index: 10010; padding: 12px 28px;
   font-family: var(--nb-font-mono); font-size: 12px; font-weight: 700;
   text-transform: uppercase; letter-spacing: 0.08em;
   border: 3px solid var(--nb-black); box-shadow: var(--nb-shadow);
@@ -299,13 +299,14 @@
 .registerevent-action-bar { padding: 14px 24px; border-top: 4px solid var(--nb-black); background: var(--nb-black); flex-shrink: 0; display: flex; gap: 8px; flex-wrap: wrap; align-items: center; }
 
 /* ── MODALS ── */
-.registerevent-modal-overlay { position: fixed; inset: 0; z-index: 900; background: rgba(0,0,0,0.88); display: flex; align-items: center; justify-content: center; padding: 20px; animation: nb-fade-in 0.15s ease; }
-.registerevent-modal { background: var(--nb-cream); border: 4px solid var(--nb-black); box-shadow: 10px 10px 0 var(--nb-black); width: 100%; max-width: 460px; max-height: 80vh; overflow: hidden; display: flex; flex-direction: column; animation: nb-slide-up 0.2s cubic-bezier(0.34,1.56,0.64,1); }
-.registerevent-modal-header { background: var(--nb-black); padding: 14px 20px; display: flex; align-items: center; justify-content: space-between; border-bottom: 4px solid var(--nb-black); flex-shrink: 0; }
+.registerevent-modal-overlay { position: fixed; inset: 0; z-index: 10000; /* above the top NavBar so the X is never covered */ background: rgba(0,0,0,0.88); display: flex; align-items: center; justify-content: center; padding: calc(16px + env(safe-area-inset-top, 0px)) 16px calc(16px + env(safe-area-inset-bottom, 0px)); overscroll-behavior: contain; animation: nb-fade-in 0.15s ease; }
+.registerevent-modal { background: var(--nb-cream); border: 4px solid var(--nb-black); box-shadow: 10px 10px 0 var(--nb-black); width: 100%; max-width: 460px; max-height: 80vh; max-height: calc(100dvh - 32px - env(safe-area-inset-top, 0px) - env(safe-area-inset-bottom, 0px)); overflow: hidden; display: flex; flex-direction: column; animation: nb-slide-up 0.2s cubic-bezier(0.34,1.56,0.64,1); }
+.registerevent-modal-header { background: var(--nb-black); padding: 12px 16px 12px 20px; gap: 12px; display: flex; align-items: center; justify-content: space-between; border-bottom: 4px solid var(--nb-black); flex-shrink: 0; }
 .registerevent-modal-title { font-family: var(--nb-font-mono); font-size: 14px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: var(--nb-yellow); margin: 0; }
-.registerevent-modal-close { width: 32px; height: 32px; background: var(--nb-yellow); color: var(--nb-black); border: 2px solid var(--nb-yellow); font-size: 18px; font-weight: 700; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all 0.1s ease; }
+.registerevent-modal-close { flex: none; width: 44px; height: 44px; touch-action: manipulation; background: var(--nb-yellow); color: var(--nb-black); border: 2px solid var(--nb-yellow); font-size: 24px; line-height: 1; font-weight: 700; cursor: pointer; display: flex; align-items: center; justify-content: center; transition: all 0.1s ease; }
 .registerevent-modal-close:hover { background: var(--nb-red); color: #fff; border-color: var(--nb-red); }
-.registerevent-modal-body { padding: 20px; overflow-y: auto; flex: 1; }
+.registerevent-modal-body { padding: 20px; overflow-y: auto; -webkit-overflow-scrolling: touch; min-height: 0; flex: 1; scrollbar-width: none; -ms-overflow-style: none; }
+.registerevent-modal-body::-webkit-scrollbar { display: none; }
 .registerevent-team-form, .registerevent-invites-list { display: flex; flex-direction: column; gap: 14px; }
 .registerevent-form-group { display: flex; flex-direction: column; gap: 6px; }
 .registerevent-form-label { font-family: var(--nb-font-mono); font-size: 10px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: var(--nb-black); }
@@ -320,7 +321,8 @@
 .registerevent-invite-confirm-btn { padding: 9px 18px; font-family: var(--nb-font-mono); font-size: 11px; font-weight: 700; text-transform: uppercase; background: var(--nb-green); color: var(--nb-black); border: 2px solid var(--nb-black); box-shadow: var(--nb-shadow-sm); cursor: pointer; transition: all 0.1s ease; }
 .registerevent-invite-confirm-btn:hover { transform: translate(-1px,-1px); box-shadow: 5px 5px 0 var(--nb-black); }
 .registerevent-qr-wrapper { display: flex; justify-content: center; padding: 16px; border: 3px solid var(--nb-black); background: #fff; margin-bottom: 14px; box-shadow: var(--nb-shadow-sm); }
-.registerevent-qr-wrapper img { display: block; border: 3px solid var(--nb-black); }
+.registerevent-qr-wrapper img { display: block; border: 3px solid var(--nb-black); width: min(240px, 62vw); height: auto; }
+@media (max-height: 740px) { .registerevent-qr-wrapper img { width: min(190px, 52vw); } }
 .registerevent-payment-details { margin-bottom: 14px; border: 3px solid var(--nb-black); }
 .registerevent-payment-row { display: flex; align-items: center; justify-content: space-between; padding: 10px 14px; background: #f9f9f9; font-family: var(--nb-font-mono); font-size: 12px; }
 .registerevent-payment-value { font-weight: 700; color: var(--nb-blue); }
@@ -369,3 +371,6 @@
   .re-gallery-card  { width: 296px; }
   .re-gallery-title { font-size: 20px; }
 }
+
+/* toasts must show above the modals */
+.flo-toast { z-index: 10010 !important; }

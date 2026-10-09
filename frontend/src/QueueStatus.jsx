@@ -1,21 +1,26 @@
 import React, { useState, useEffect, useRef, useCallback } from 'react';
 import { apiFetch } from './api.js';
+import './QueueStatus.css';
 
-export default function QueueStatus({ eventId, initialData, onSeatAvailable, onExpired }) {
-  const [data, setData]               = useState(initialData || null);
+export default function QueueStatus({ eventId, initialData, onSeatAvailable, onExpired, contactPhone, contactName }) {
+  const [data, setData] = useState(initialData || null);
   const [secondsLeft, setSecondsLeft] = useState(initialData?.expiresIn || 0);
-  const pollRef    = useRef(null);
-  const timerRef   = useRef(null);
+  const pollRef = useRef(null);
   const mountedRef = useRef(true);
-  // ── tracks latest status so the unmount closure can read it ──
-  const dataRef    = useRef(initialData || null);
+  const dataRef = useRef(initialData || null);
+  // pending "leave the queue" call (so React StrictMode's fake unmount can cancel it)
+  const releaseRef = useRef({ timer: null, eventId: null });
+
+  // Parent passes new inline functions on every render. Keep them in a ref so they
+  // never change `poll`, otherwise the effect below re-runs on every parent render
+  // and its cleanup used to call DELETE /release-queue (removing you from the queue).
+  const cbRef = useRef({ onSeatAvailable, onExpired });
+  cbRef.current = { onSeatAvailable, onExpired };
 
   // ── countdown tick ────────────────────────────────────────────
   useEffect(() => {
-    timerRef.current = setInterval(() => {
-      setSecondsLeft(s => (s <= 1 ? 0 : s - 1));
-    }, 1000);
-    return () => clearInterval(timerRef.current);
+    const t = setInterval(() => setSecondsLeft(s => (s <= 1 ? 0 : s - 1)), 1000);
+    return () => clearInterval(t);
   }, []);
 
   // ── keep dataRef in sync + reset countdown on fresh server data
@@ -24,7 +29,7 @@ export default function QueueStatus({ eventId, initialData, onSeatAvailable, onE
     if (data?.expiresIn != null) setSecondsLeft(data.expiresIn);
   }, [data]);
 
-  // ── poll server every 8s ──────────────────────────────────────
+  // ── poll server ───────────────────────────────────────────────
   const poll = useCallback(async () => {
     if (!mountedRef.current) return;
     try {
@@ -33,69 +38,77 @@ export default function QueueStatus({ eventId, initialData, onSeatAvailable, onE
       const d = await res.json();
       if (!mountedRef.current) return;
 
-      if (d.status === 'expired') { onExpired?.(); return; }
-      if (d.status === 'submitted') return;
+      // Anything other than queued/holding means we no longer have a place in line.
+      if (['expired', 'registered', 'available', 'full', 'seat_taken'].includes(d.status)) {
+        cbRef.current.onExpired?.();
+        return;
+      }
+      if (d.status === 'submitted' || d.status === 'rejected') return;
 
       if (d.status === 'holding' && d.promoted) {
         setData(d);
         setSecondsLeft(d.expiresIn);
-        onSeatAvailable?.();
+        cbRef.current.onSeatAvailable?.();
         return;
       }
       setData(d);
-    } catch (_) {}
-  }, [eventId, onSeatAvailable, onExpired]);
+    } catch (_) { }
+  }, [eventId]);
 
-  // ── mount: start polling  |  unmount: smart cleanup ───────────
+  // ── mount: start polling | real unmount: leave queue ──────────
   useEffect(() => {
     mountedRef.current = true;
+
+    // StrictMode (dev) mounts, unmounts and re-mounts instantly. Cancel the pending release.
+    if (releaseRef.current.timer && releaseRef.current.eventId === eventId) {
+      clearTimeout(releaseRef.current.timer);
+      releaseRef.current.timer = null;
+    }
+
     poll();
-    pollRef.current = setInterval(poll, 8000);
+    const loop = () => {
+      // every 15s plus a random 0-5s so thousands of students never poll in the same second
+      pollRef.current = setTimeout(async () => {
+        await poll();
+        if (mountedRef.current) loop();
+      }, 15000 + Math.random() * 5000);
+    };
+    loop();
 
     return () => {
       mountedRef.current = false;
-      clearInterval(pollRef.current);
-      clearInterval(timerRef.current);   // ← was missing before
+      clearTimeout(pollRef.current);
 
-      const current = dataRef.current;
-
-      // If user was only QUEUED (no seat held), release their spot
-      // immediately so the person behind them moves up right away.
-      // If they were HOLDING, do nothing — the UPI modal is about to
-      // open and they still need the 15-min window to pay.
-      if (current?.status === 'queued') {
-        apiFetch(`/api/events/${eventId}/release-queue`, { method: 'DELETE' })
-          .catch(() => {});            // fire-and-forget, ignore errors
+      // Only release if the person was merely QUEUED. If HOLDING, keep the seat for payment.
+      // Delay by one tick: a fake StrictMode unmount is cancelled by the effect above.
+      if (dataRef.current?.status === 'queued') {
+        releaseRef.current.eventId = eventId;
+        releaseRef.current.timer = setTimeout(() => {
+          releaseRef.current.timer = null;
+          apiFetch(`/api/events/${eventId}/release-queue`, { method: 'DELETE' }).catch(() => { });
+        }, 0);
       }
     };
   }, [poll, eventId]);
 
-  // ── expired via countdown ─────────────────────────────────────
+  // ── hold timer reached 0 → ask the server what happened ───────
   useEffect(() => {
-    if (secondsLeft === 0 && data && data.status !== 'holding') {
-      poll();
-    }
-  }, [secondsLeft]);
+    if (secondsLeft === 0 && data?.status === 'holding') poll();
+  }, [secondsLeft]); // eslint-disable-line react-hooks/exhaustive-deps
 
-  // ── format timer ──────────────────────────────────────────────
-  const mins    = Math.floor(secondsLeft / 60);
-  const secs    = secondsLeft % 60;
+  const help = contactPhone ? (
+    <div className="queue-status-hint" style={{ marginTop: 10, color: '#0a0a0a', fontWeight: 600 }}>
+      Need help? Call {contactName ? `${contactName} ` : 'the organiser '}
+      <a href={`tel:${contactPhone}`} style={{ color: '#0047FF' }}>{contactPhone}</a>
+    </div>
+  ) : null;
+
+  const mins = Math.floor(secondsLeft / 60);
+  const secs = secondsLeft % 60;
   const timeStr = `${mins}:${secs.toString().padStart(2, '0')}`;
 
-  if (!data) {
-    return (
-      <div className="queue-status holding">
-        <div className="queue-status-icon">⏳</div>
-        <div className="queue-status-body">
-          <div className="queue-status-title">CONNECTING…</div>
-          <div className="queue-status-sub">Checking your position…</div>
-        </div>
-      </div>
-    );
-  }
-
   // ── HOLDING ───────────────────────────────────────────────────
-  if (data.status === 'holding') {
+  if (data?.status === 'holding') {
     return (
       <div className="queue-status holding">
         <div className="queue-status-icon">🎟️</div>
@@ -105,14 +118,16 @@ export default function QueueStatus({ eventId, initialData, onSeatAvailable, onE
             Complete payment within <strong>{timeStr}</strong> or your seat will be released.
           </div>
           <div className="queue-status-timer">{timeStr}</div>
+          {help}
         </div>
       </div>
     );
   }
 
   // ── QUEUED ────────────────────────────────────────────────────
-  if (data.status === 'queued') {
+  if (data?.status === 'queued') {
     const pos = data.queuePosition ?? '…';
+    const posNum = typeof pos === 'number' ? pos : 1;
     return (
       <div className="queue-status queued">
         <div className="queue-status-icon">🔢</div>
@@ -121,8 +136,8 @@ export default function QueueStatus({ eventId, initialData, onSeatAvailable, onE
             YOU ARE <span className="queue-pos">#{pos}</span> IN QUEUE
           </div>
           <div className="queue-status-sub">
-            The event is currently full. You'll be automatically moved up as seats open.
-            Keep this window open. Queue expires in <strong>{timeStr}</strong>.
+            The event is currently full. You keep your place in line and move up as seats open.
+            When it is your turn you get <strong>15 minutes</strong> to pay. Keep this window open.
           </div>
           <div className="queue-status-progress">
             <div className="queue-status-progress-label">
@@ -132,17 +147,25 @@ export default function QueueStatus({ eventId, initialData, onSeatAvailable, onE
             <div className="queue-bar-track">
               <div
                 className="queue-bar-fill"
-                style={{ width: pos === 1 ? '90%' : `${Math.max(5, 100 - (pos - 1) * 15)}%` }}
+                style={{ width: posNum === 1 ? '90%' : `${Math.max(5, 100 - (posNum - 1) * 15)}%` }}
               />
             </div>
-            <div className="queue-status-hint">
-              Polling for updates every few seconds…
-            </div>
+            <div className="queue-status-hint">This updates automatically every few seconds.</div>
           </div>
+          {help}
         </div>
       </div>
     );
   }
 
-  return null;
+  // ── CONNECTING / anything else (never render a blank box) ─────
+  return (
+    <div className="queue-status holding">
+      <div className="queue-status-icon">⏳</div>
+      <div className="queue-status-body">
+        <div className="queue-status-title">CONNECTING…</div>
+        <div className="queue-status-sub">Checking your position…</div>
+      </div>
+    </div>
+  );
 }

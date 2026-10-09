@@ -5,6 +5,17 @@ import { apiFetch } from "./api.js";
 
 import { PDFDocument, rgb, StandardFonts } from 'pdf-lib';
 import fontkit from '@pdf-lib/fontkit';
+import { generateCertificatePdf } from './certificatePdf.js';
+import { buildCertData, normalizeLayout } from './certificateLib.js';
+
+// Where a volunteer is with the new certificate system (events made before it keep the old flow)
+const certState = (ev) => {
+  if (!ev.certificateEnabled) return 'legacy';
+  if (ev.volunteerCertificateMode === 'none') return 'none';
+  if (!ev.certificateReleased) return 'pending';
+  if (ev.certificateReleaseMode !== 'all' && !ev.VolnStatus) return 'not_eligible';
+  return 'ready';
+};
 
 let cachedFontBytes = null;
 
@@ -150,6 +161,24 @@ const Volunteers = () => {
     setGeneratingIds(prev => new Set(prev).add(event.eid));
 
     try {
+      // New certificate system: design is made by the organiser, released by the organiser
+      if (event.certificateEnabled) {
+        const r = await apiFetch(`/api/events/${event.eid}/certificate`, { method: 'GET' });
+        const j = await r.json().catch(() => ({}));
+        if (!r.ok) { alert(j.error || 'Certificate is not available yet.'); return; }
+        const data = buildCertData({
+          name: userInfo.userName, usn: userInfo.userUSN, event: event.ename, date: event.eventDate,
+          points: event.earnedActivityPts || j.points || 0, customText: j.certificateInfo, role: 'volunteer',
+        });
+        const bytes = await generateCertificatePdf({ template: j.template, layout: normalizeLayout(j.template, j.layout), data });
+        const url = window.URL.createObjectURL(new Blob([bytes], { type: 'application/pdf' }));
+        setDownloadLinks(prev => ({
+          ...prev,
+          [event.eid]: { url, filename: `Certificate_${userInfo.userUSN || event.eid}.pdf` },
+        }));
+        return;
+      }
+
       if (!event.VolnStatus) {
         alert('Certificate is only available for confirmed volunteer participation.');
         setGeneratingIds(prev => { const next = new Set(prev); next.delete(event.eid); return next; });
@@ -267,6 +296,9 @@ const Volunteers = () => {
             ? <span className="status-confirmed"><i className="fas fa-check"></i> Confirmed</span>
             : <span className="status-reg"><i className="fas fa-hourglass-half"></i> Registered</span>
           }
+          {event.whatsappLink && (
+            <a className="status-reg" href={event.whatsappLink} target="_blank" rel="noopener noreferrer"><i className="fab fa-whatsapp"></i> WhatsApp group</a>
+          )}
           {(event.earnedActivityPts || 0) > 0 && (
             <span className="vol-activity-points"><i className="fas fa-star"></i> {event.earnedActivityPts} Claimable Pts</span>
           )}
@@ -274,6 +306,13 @@ const Volunteers = () => {
 
         <div className="vol-card-action-bar">
           {isPast ? (
+            certState(event) === 'none' ? (
+              <span className="status-reg">No certificate for this event</span>
+            ) : certState(event) === 'pending' ? (
+              <button className="vol-action-btn secondary" disabled>Certificate pending</button>
+            ) : certState(event) === 'not_eligible' ? (
+              <button className="vol-action-btn secondary" disabled>Confirmed volunteers only</button>
+            ) : (
             generatingIds.has(event.eid) ? (
               <button className="vol-action-btn primary" disabled>Generating...</button>
             ) : downloadLinks[event.eid] ? (
@@ -284,6 +323,7 @@ const Volunteers = () => {
               <button className="vol-action-btn primary" onClick={() => handleEventButtonClick(event, type)}>
                 <i className="fas fa-certificate"></i> Certificate
               </button>
+            )
             )
           ) : (
             <button className="vol-action-btn secondary" onClick={() => handleEventButtonClick(event, type)}>

@@ -4,6 +4,8 @@ import DOMPurify from 'dompurify';
 import './organisers.css';
 
 import { apiFetch } from './api.js';
+import CertificateSettings from './CertificateSettings.jsx';
+import './org_payments_extra.css';
 
 const Organisers = () => {
   const navigate = useNavigate();
@@ -16,11 +18,15 @@ const Organisers = () => {
   const [loading, setLoading] = useState(true);
   const [error, setError] = useState(null);
   const [generatingExcel, setGeneratingExcel] = useState({});
+  const [certEvent, setCertEvent] = useState(null);
 
   // Payment States
   const [showPaymentModal, setShowPaymentModal] = useState(false);
   const [selectedEventForPayments, setSelectedEventForPayments] = useState(null);
   const [pendingPayments, setPendingPayments] = useState([]);
+  const [refundNeeded, setRefundNeeded] = useState([]);
+  const [rejectTarget, setRejectTarget] = useState(null);   // payment row being rejected
+  const [rejectReason, setRejectReason] = useState('');
   const [loadingPayments, setLoadingPayments] = useState(false);
   const [processingPayment, setProcessingPayment] = useState({});
   const [isTeamEvent, setIsTeamEvent] = useState(false);
@@ -204,14 +210,56 @@ const Organisers = () => {
 
       const data = await response.json();
       setPendingPayments(data.pendingPayments || []);
+      setRefundNeeded(data.refundNeeded || []);
+      setRejectTarget(null); setRejectReason('');
       setIsTeamEvent(data.isTeamEvent || false);
     } catch (err) {
       console.error('Error fetching pending payments:', err);
       alert('Error loading pending payments');
       setPendingPayments([]);
+      setRefundNeeded([]);
       setIsTeamEvent(false);
     } finally {
       setLoadingPayments(false);
+    }
+  };
+
+  // Reject a payment. The reason is optional; the student always sees "rejected" on the website,
+  // and gets an email only when a reason was written.
+  const handleRejectPayment = async () => {
+    if (!rejectTarget || !selectedEventForPayments) return;
+    const usn = rejectTarget.partusn;
+    if (processingPayment[usn]) return;
+    setProcessingPayment((prev) => ({ ...prev, [usn]: 'rejecting' }));
+    try {
+      const response = await apiFetch('/api/payments/reject', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ participantUSN: usn, eventId: selectedEventForPayments.eid, reason: rejectReason.trim() }),
+      });
+      const data = await response.json().catch(() => ({}));
+      if (!response.ok) throw new Error(data.error || `HTTP status ${response.status}`);
+      setPendingPayments((prev) => prev.filter((p) => p.partusn !== usn));
+      setRejectTarget(null); setRejectReason('');
+    } catch (err) {
+      alert(`Error: ${err.message || 'Failed to reject payment. Please try again.'}`);
+    } finally {
+      setProcessingPayment((prev) => ({ ...prev, [usn]: null }));
+    }
+  };
+
+  // The student paid after their seat went to someone else; organiser refunds, then marks it done.
+  const handleRefunded = async (participantUSN) => {
+    try {
+      const response = await apiFetch('/api/payments/refunded', {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ participantUSN, eventId: selectedEventForPayments.eid }),
+      });
+      if (!response.ok) throw new Error('Failed');
+      setRefundNeeded((prev) => prev.filter((r) => r.partusn !== participantUSN));
+    } catch (err) {
+      alert('Could not update. Please try again.');
     }
   };
 
@@ -354,6 +402,9 @@ const Organisers = () => {
             <i className="fas fa-credit-card"></i> Verify Pay
           </button>
         )}
+        <button className="org-action-btn view" onClick={() => setCertEvent(event)}>
+          <i className="fas fa-certificate"></i> Certificate
+        </button>
         <button
           className="org-action-btn excel"
           onClick={() => handleGenerateDetails(event.eid, event.ename)}
@@ -521,6 +572,10 @@ const Organisers = () => {
       </button>
 
       {/* PAYMENT MODAL — logic unchanged */}
+      {certEvent && (
+        <CertificateSettings event={certEvent} onClose={() => setCertEvent(null)} />
+      )}
+
       {showPaymentModal && (
         <div
           className="org-fintech-modal-overlay"
@@ -542,7 +597,7 @@ const Organisers = () => {
                   <div className="org-spinner-dots"></div>
                   <p>Loading transactions...</p>
                 </div>
-              ) : pendingPayments.length === 0 ? (
+              ) : pendingPayments.length === 0 && refundNeeded.length === 0 ? (
                 <div className="org-empty-payments">
                   <div className="org-check-ring-lg"><i className="fas fa-check"></i></div>
                   <h3>All Caught Up!</h3>
@@ -557,11 +612,12 @@ const Organisers = () => {
                     </div>
                   )}
                   {pendingPayments.map((payment, index) => (
-                    <div className="org-payment-row-card" key={index} style={{ animationDelay: `${index * 0.05}s` }}>
+                    <React.Fragment key={payment.partusn + '-' + index}>
+                    <div className="org-payment-row-card" style={{ animationDelay: `${index * 0.05}s` }}>
                       <div className="org-pay-user-info">
                         <div className="org-avatar-placeholder">{payment.studentName.charAt(0)}</div>
                         <div className="org-text-details">
-                          <h5>{DOMPurify.sanitize(payment.studentName)} {payment.isTeamLeader && <span className="org-tag-leader">LEADER</span>}</h5>
+                          <h5>{DOMPurify.sanitize(payment.studentName)} {payment.isTeamLeader && <span className="org-tag-leader">LEADER</span>}{payment.late && <span className="org-tag-late">LATE</span>}</h5>
                           <span className="org-usn">{payment.partusn}</span>
                         </div>
                       </div>
@@ -573,6 +629,7 @@ const Organisers = () => {
                         {processingPayment[payment.partusn] === 'success' ? (
                           <div className="org-success-tick-anim"><i className="fas fa-check-circle"></i></div>
                         ) : (
+                          <>
                           <button
                             className={`org-verify-btn ${processingPayment[payment.partusn] ? 'loading' : ''}`}
                             onClick={(e) => { e.stopPropagation(); handleVerifyPayment(payment.partusn, selectedEventForPayments.eid); }}
@@ -581,10 +638,56 @@ const Organisers = () => {
                           >
                             {processingPayment[payment.partusn] === 'verifying' ? <div className="org-spinner-dots-sm"></div> : 'Approve'}
                           </button>
+                          <button
+                            className="org-reject-btn"
+                            onClick={(e) => { e.stopPropagation(); setRejectTarget(payment); setRejectReason(''); }}
+                            disabled={!!processingPayment[payment.partusn]}
+                          >
+                            Reject
+                          </button>
+                          </>
                         )}
                       </div>
                     </div>
+                    {payment.late && (
+                      <div className="org-late-note">
+                        Paid after the 15-minute hold ended, but the seat was still free. Approve to confirm it, or reject.
+                      </div>
+                    )}
+                    {rejectTarget && rejectTarget.partusn === payment.partusn && (
+                      <div className="org-reject-panel">
+                        <label htmlFor={`rj-${payment.partusn}`}>Reason (optional)</label>
+                        <textarea
+                          id={`rj-${payment.partusn}`}
+                          value={rejectReason}
+                          maxLength={300}
+                          placeholder="e.g. Amount not received / wrong transaction ID"
+                          onChange={(e) => setRejectReason(e.target.value)}
+                        />
+                        <p className="hint">The seat is released and offered to the next person in line. The student sees "rejected" on the website{rejectReason.trim() ? ' and gets this reason by email' : ' (no email is sent without a reason)'}.</p>
+                        <div className="row">
+                          <button className="org-reject-btn" onClick={handleRejectPayment} disabled={!!processingPayment[payment.partusn]}>
+                            {processingPayment[payment.partusn] === 'rejecting' ? 'Rejecting…' : 'Confirm reject'}
+                          </button>
+                          <button className="org-reject-btn" onClick={() => { setRejectTarget(null); setRejectReason(''); }}>Cancel</button>
+                        </div>
+                      </div>
+                    )}
+                    </React.Fragment>
                   ))}
+
+                  {refundNeeded.length > 0 && (
+                    <div className="org-refund-box">
+                      <h4>Refund needed</h4>
+                      <p>These students paid after their seat had already gone to the next person. Refund them, then tap Done.</p>
+                      {refundNeeded.map((r) => (
+                        <div className="org-refund-row" key={r.partusn}>
+                          <span><strong>{DOMPurify.sanitize(r.studentName)}</strong> · {r.partusn} · {r.studentMobile}<br />ID: {r.transactionId} · ₹{r.amount}</span>
+                          <button className="org-reject-btn" onClick={() => handleRefunded(r.partusn)}>Refunded · Done</button>
+                        </div>
+                      ))}
+                    </div>
+                  )}
                 </div>
               )}
             </div>

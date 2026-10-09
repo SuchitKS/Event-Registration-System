@@ -186,6 +186,11 @@ export default function OrganizerRequest() {
             {existingRequest?.status === 'rejected' && (
               <div className="org-req-rejected-notice">
                 <span>✕</span> Your previous request was rejected. You may resubmit below.
+                {existingRequest.reject_reason && (
+                  <div style={{ marginTop: 6, textTransform: 'none', letterSpacing: 0, fontWeight: 600 }}>
+                    Reason: {existingRequest.reject_reason}
+                  </div>
+                )}
               </div>
             )}
 
@@ -223,6 +228,7 @@ export default function OrganizerRequest() {
                 className="org-req-input"
                 type="text"
                 name="college_name"
+                maxLength={255}
                 placeholder="e.g. BMS College of Engineering"
                 value={formData.college_name}
                 onChange={handleChange}
@@ -255,6 +261,7 @@ export default function OrganizerRequest() {
                   style={{ marginTop: '8px' }}
                   type="text"
                   name="club_name"
+                  maxLength={50}
                   placeholder="Type your club name here"
                   value={formData.club_name}
                   onChange={handleChange}
@@ -269,6 +276,7 @@ export default function OrganizerRequest() {
                 className="org-req-input"
                 type="text"
                 name="role_in_club"
+                maxLength={100}
                 placeholder="e.g. President, Event Coordinator, Secretary"
                 value={formData.role_in_club}
                 onChange={handleChange}
