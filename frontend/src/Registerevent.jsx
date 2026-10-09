@@ -498,9 +498,33 @@ export default function Registerevent() {
   const [transactionId, setTransactionId]       = useState("")
   const [isSubmitting, setIsSubmitting]         = useState(false)
   const [qrCodeDataUrl, setQrCodeDataUrl]       = useState("")
+  const [upiSecondsLeft, setUpiSecondsLeft]     = useState(0)
   const timerRef      = useRef(null)
   const modalTimerRef = useRef(null)
   const sliderDomRef  = useRef(null)
+
+  useEffect(() => {
+    if (!showUpiModal) return;
+    if (upiSecondsLeft <= 0) {
+      setShowUpiModal(null);
+      setTransactionId("");
+      showFlash("error", "Your 15-minute reservation expired.");
+      return;
+    }
+    const t = setInterval(() => {
+      setUpiSecondsLeft(s => {
+        if (s <= 1) {
+          clearInterval(t);
+          setShowUpiModal(null);
+          setTransactionId("");
+          showFlash("error", "Your 15-minute reservation expired.");
+          return 0;
+        }
+        return s - 1;
+      });
+    }, 1000);
+    return () => clearInterval(t);
+  }, [showUpiModal]); // Only restart interval when modal opens/closes
 
   function showFlash(type, message) {
     if (timerRef.current) clearTimeout(timerRef.current)
@@ -657,9 +681,14 @@ export default function Registerevent() {
       const d = await r.json();
       if (!r.ok) { showFlash("error", d.error || "Failed to claim seat"); return; }
 
-      if (d.status === 'holding' || d.status === 'queued') {
-        // Event full (queued) OR seat reserved (holding) — show queue status modal
-        // This ensures they see the 15-minute countdown and can click PAY NOW
+      if (d.status === 'holding') {
+        // Seat available immediately — open UPI payment modal directly
+        if (!event.upiId) { showFlash("error", "Payment not setup for this event."); return; }
+        setTransactionId(""); setModalFlash({ type: "", message: "" });
+        setShowUpiModal({ event, isTeam: false });
+        setUpiSecondsLeft(d.expiresIn != null ? d.expiresIn : 15 * 60);
+      } else if (d.status === 'queued') {
+        // Event full (queued) — show queue status modal
         setActiveQueueEvent({ event, claimData: d });
       }
     } catch {
@@ -669,11 +698,12 @@ export default function Registerevent() {
 
   // Called by QueueStatus when user is promoted from queued → holding
   // and also when they already had a holding slot on first claim
-  function handleSeatAvailable(event) {
+  function handleSeatAvailable(event, secs) {
     setActiveQueueEvent(null);
     if (!event.upiId) { showFlash("error", "Payment not setup."); return; }
     setTransactionId(""); setModalFlash({ type: "", message: "" });
     setShowUpiModal({ event, isTeam: false });
+    setUpiSecondsLeft(secs != null ? secs : 15 * 60);
   }
 
   function handleQueueExpired() {
@@ -872,7 +902,7 @@ export default function Registerevent() {
               <QueueStatus
                 eventId={activeQueueEvent.event.eid}
                 initialData={activeQueueEvent.claimData}
-                onSeatAvailable={() => handleSeatAvailable(activeQueueEvent.event)}
+                onSeatAvailable={(secs) => handleSeatAvailable(activeQueueEvent.event, secs)}
                 onExpired={handleQueueExpired}
                 contactPhone={activeQueueEvent.event.contactPhone}
                 contactName={activeQueueEvent.event.contactName}
@@ -1058,6 +1088,11 @@ export default function Registerevent() {
                 </div>
               )}
               <div className="registerevent-qr-wrapper">{qrCodeDataUrl?<img src={qrCodeDataUrl} alt="QR" style={{display:'block',maxWidth:'100%'}}/>:<div className="registerevent-spinner" style={{margin:'40px auto'}}></div>}</div>
+              {upiSecondsLeft > 0 && (
+                <div style={{ color: 'var(--nb-red)', fontFamily: 'var(--nb-font-mono)', fontWeight: 'bold', fontSize: '18px', marginBottom: '15px' }}>
+                  Time left: {Math.floor(upiSecondsLeft / 60)}:{String(upiSecondsLeft % 60).padStart(2, '0')}
+                </div>
+              )}
               <p style={{color:'var(--nb-black)',marginBottom:'20px',fontFamily:'var(--nb-font-mono)',fontSize:'13px',fontWeight:700}}>Pay <strong>₹{showUpiModal.event.regFee}</strong></p>
               <div className="registerevent-payment-details"><div className="registerevent-payment-row"><span style={{color:'#888'}}>UPI ID</span><span className="registerevent-payment-value">{showUpiModal.event.upiId}</span></div></div>
               <input className="registerevent-form-input" placeholder="Transaction ID (UTR)" value={transactionId} onChange={e=>setTransactionId(e.target.value)} disabled={isSubmitting} />
