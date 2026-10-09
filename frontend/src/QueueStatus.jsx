@@ -45,7 +45,7 @@ export default function QueueStatus({ eventId, initialData, onSeatAvailable, onE
       }
       if (d.status === 'submitted' || d.status === 'rejected') return;
 
-      if (d.status === 'holding' && d.promoted) {
+      if (d.status === 'holding') {
         cbRef.current.onSeatAvailable?.(d.expiresIn);
         return;
       }
