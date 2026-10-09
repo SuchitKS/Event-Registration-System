@@ -48,7 +48,6 @@ export default function QueueStatus({ eventId, initialData, onSeatAvailable, onE
       if (d.status === 'holding' && d.promoted) {
         setData(d);
         setSecondsLeft(d.expiresIn);
-        cbRef.current.onSeatAvailable?.();
         return;
       }
       setData(d);
