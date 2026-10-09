@@ -657,13 +657,9 @@ export default function Registerevent() {
       const d = await r.json();
       if (!r.ok) { showFlash("error", d.error || "Failed to claim seat"); return; }
 
-      if (d.status === 'holding') {
-        // Seat available immediately — open UPI payment modal directly
-        if (!event.upiId) { showFlash("error", "Payment not setup for this event."); return; }
-        setTransactionId(""); setModalFlash({ type: "", message: "" });
-        setShowUpiModal({ event, isTeam: false });
-      } else if (d.status === 'queued') {
-        // Event full — show queue position modal, wait for promotion
+      if (d.status === 'holding' || d.status === 'queued') {
+        // Event full (queued) OR seat reserved (holding) — show queue status modal
+        // This ensures they see the 15-minute countdown and can click PAY NOW
         setActiveQueueEvent({ event, claimData: d });
       }
     } catch {
@@ -694,12 +690,9 @@ export default function Registerevent() {
   }
 
   // ── Close UPI modal without paying ────────────────────────────────────────
-  // Immediately releases holding slot so next person in queue can be promoted.
+  // Does NOT release the holding slot so the user keeps their 15-minute reservation.
   function handleCloseUpiModal() {
     if (isSubmitting) return;
-    const { event } = showUpiModal;
-    // Fire-and-forget: release the holding slot
-    apiFetch(`/api/events/${event.eid}/release-holding`, { method: 'DELETE' }).catch(() => {});
     setShowUpiModal(null);
     setTransactionId("");
   }
