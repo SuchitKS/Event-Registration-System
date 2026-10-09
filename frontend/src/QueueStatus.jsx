@@ -46,8 +46,7 @@ export default function QueueStatus({ eventId, initialData, onSeatAvailable, onE
       if (d.status === 'submitted' || d.status === 'rejected') return;
 
       if (d.status === 'holding' && d.promoted) {
-        setData(d);
-        setSecondsLeft(d.expiresIn);
+        cbRef.current.onSeatAvailable?.(d.expiresIn);
         return;
       }
       setData(d);
@@ -123,7 +122,7 @@ export default function QueueStatus({ eventId, initialData, onSeatAvailable, onE
               color: '#FFE500', fontWeight: 'bold', border: 'none', 
               cursor: 'pointer', display: 'block', width: '100%', fontSize: '16px' 
             }} 
-            onClick={() => cbRef.current.onSeatAvailable?.()}
+            onClick={() => cbRef.current.onSeatAvailable?.(secondsLeft)}
           >
             PAY NOW
           </button>
